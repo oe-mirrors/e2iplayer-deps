@@ -235,7 +235,7 @@ static PyObject* _subparser_strip_html_tags(PyObject *self, PyObject *args, PyOb
     if (!PyUnicode_Check(string))
         return NULL;
 
-    if (PyUnicode_AsStringAndSize(string, &in, &isize) == -1) {
+    if (PyBytes_AsStringAndSize(string, &in, &isize) == -1) {
         return NULL; // not a string object or it contains null bytes
     }
 
