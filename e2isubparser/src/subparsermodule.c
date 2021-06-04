@@ -308,7 +308,7 @@ static struct PyModuleDef moduledef = {
 
 PyMODINIT_FUNC init_subparser(void)
 {
-	PyModule_Create(&moduledef);
+	return PyModule_Create(&moduledef);
 }
 
 #else
