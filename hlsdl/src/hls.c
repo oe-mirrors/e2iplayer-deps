@@ -287,6 +287,12 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
         } else if (!strncmp(tag, "#EXT-X-ENDLIST", 14)){
             me->is_endlist = true;
             return 0;
+        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY-SEQUENCE:", 29)){
+            sscanf(tag+29, "%d", &(me->discontinuity_sequence));
+            return 0;
+        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY", 20)){
+            ms->discontinuity = true;
+            return 0;
         } else if (!strncmp(tag, "#EXT-X-MEDIA-SEQUENCE:", 22)){
             if(sscanf(tag+22, "%d",  &(me->first_media_sequence)) == 1){
                 return 0;
@@ -1347,6 +1353,42 @@ static void *hls_playlist_update_thread(void *arg)
     return NULL;
 }
 
+/* An fMP4 / CMAF segment starts with an ISO-BMFF box: <4-byte size><4-byte
+ * type>. A TS segment starts with the 0x47 sync byte. */
+static bool buffer_is_fmp4(const struct ByteBuffer *buf)
+{
+    if (!buf || !buf->data || buf->len < 8) {
+        return false;
+    }
+    const uint8_t *t = (const uint8_t *)buf->data + 4;
+    return !memcmp(t, "ftyp", 4) || !memcmp(t, "styp", 4)
+        || !memcmp(t, "moof", 4) || !memcmp(t, "moov", 4)
+        || !memcmp(t, "sidx", 4) || !memcmp(t, "emsg", 4);
+}
+
+/* Called once, after the first EXT-X-MAP or media segment has been fetched.
+ * Sets me->media_type and rejects the combinations hlsdl cannot produce a
+ * usable file for. Returns non-zero to abort the download. */
+static int detect_media_type(hls_media_playlist_t *me, const struct ByteBuffer *first)
+{
+    if (me->media_type != MEDIA_TYPE_UNKNOWN) {
+        return 0;
+    }
+    me->media_type = buffer_is_fmp4(first) ? MEDIA_TYPE_FMP4 : MEDIA_TYPE_TS;
+
+    if (me->media_type == MEDIA_TYPE_FMP4) {
+        MSG_VERBOSE("Fragmented MP4 stream.\n");
+        if (me->encryption && (me->encryptiontype == ENC_AES_SAMPLE
+                            || me->encryptiontype == ENC_AES_SAMPLE_CTR)) {
+            MSG_ERROR("SAMPLE-AES encrypted fragmented MP4 is not supported by "
+                      "hlsdl - use a remuxer (e.g. ffmpeg).\n");
+            MSG_API("{\"error_code\":0, \"error_msg\":\"fmp4-sample-aes\"}\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
@@ -1488,6 +1530,16 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                     MSG_WARNING("Live mode skipping segment %d. http_code[%d].\n", ms->sequence_number, (int)http_code);
                     break;
                 }
+            }
+
+            if (0 != detect_media_type(me, &seg)) {
+                free(seg.data);
+                download = false;
+                pthread_cancel(thread);
+                break;
+            }
+            if (ms->discontinuity) {
+                MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
             }
 
             downloaded_duration_ms += ms->duration_ms;
@@ -1662,6 +1714,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     struct hls_media_segment *ms = me->first_media_segment;
     struct hls_media_segment *ms_audio = NULL;
     merge_context_t merge_context;
+    bool drop_audio = false;
 
     if (me_audio) {
         ms_audio = me_audio->first_media_segment;
@@ -1670,11 +1723,16 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     }
 
     while(ms) {
-        /* fMP4 initialization segment (EXT-X-MAP): write it verbatim, never run
-         * it through the TS packet scanner or the audio/video merge, and do not
+        /* Initialization segment (EXT-X-MAP): write it verbatim, never run it
+         * through the TS packet scanner or the audio/video merge, and do not
          * consume a segment from the other playlist for it. */
         if (ms->is_map) {
             if (0 != vod_download_segment(&session, me, ms, &seg)) {
+                break;
+            }
+            if (0 != detect_media_type(me, &seg)) {
+                free(seg.data);
+                ret = 1;
                 break;
             }
             download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
@@ -1686,7 +1744,9 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
             if (0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
                 break;
             }
-            download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
+            if (!drop_audio) {
+                download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
+            }
             free(seg_audio.data);
             ms_audio = ms_audio->next;
             continue;
@@ -1694,6 +1754,35 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
 
         if (0 != vod_download_segment(&session, me, ms, &seg)) {
             break;
+        }
+
+        if (0 != detect_media_type(me, &seg)) {
+            free(seg.data);
+            ret = 1;
+            break;
+        }
+
+        if (ms->discontinuity) {
+            MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
+        }
+
+        /* Fragmented MP4: concatenate init + media fragments verbatim. A
+         * separate audio rendition cannot be muxed here. */
+        if (me->media_type == MEDIA_TYPE_FMP4) {
+            if (ms_audio && !drop_audio) {
+                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
+                drop_audio = true;
+            }
+            download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+            free(seg.data);
+            downloaded_duration_ms += ms->duration_ms;
+            time_t curRepTime = time(NULL);
+            if ((curRepTime - repTime) >= 1) {
+                MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(downloaded_duration_ms / 1000), download_size);
+                repTime = curRepTime;
+            }
+            ms = ms->next;
+            continue;
         }
 
         uint8_t *first_video_packet = find_first_ts_packet(&seg);
