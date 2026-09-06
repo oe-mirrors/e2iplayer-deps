@@ -11,8 +11,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: install libcurl / libcrypto
-        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev ffmpeg
       - name: make
         run: make -C hlsdl
       - name: TS stream (AES-128, muxed)
@@ -26,10 +26,30 @@ jobs:
           timeout 180 ./hlsdl/hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
           test -s test_fmp4.mp4
           dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          ffprobe -v error -show_entries format=format_name -of csv=p=0 test_fmp4.mp4 | grep -q mp4
+      # Locally generated fixtures - deterministic, no network. Exercises the
+      # local-playlist path, fMP4 EXT-X-MAP, and a mid-stream discontinuity.
+      - name: local fixtures (fMP4 EXT-X-MAP, TS discontinuity)
+        run: |
+          set -eux
+          mkdir fx && cd fx
+          # real fMP4 HLS with #EXT-X-MAP:URI="init.mp4"
+          ffmpeg -v error -f lavfi -i testsrc=d=3:s=128x72 -c:v libx264 -g 15 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 fmp4.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_fmp4.mp4 fmp4.m3u8
+          ffprobe -v error -show_entries stream=codec_name -of csv=p=0 out_fmp4.mp4
+          # TS with a mid-stream #EXT-X-DISCONTINUITY (resolution change)
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d0.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d1.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=64x48  -c:v mpeg2video -f mpegts d2.ts
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nd0.ts\n#EXTINF:1.0,\nd1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nd2.ts\n#EXT-X-ENDLIST\n' > disc.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_disc.ts disc.m3u8
+          ffprobe -v error -show_entries format=format_name -of csv=p=0 out_disc.ts
 
   # ---------------------------------------------------------- e2isubparser
-  # Old C (VLC / ffmpeg snippets from ~2015); build permissively on an
-  # older toolchain. Goal: it links into a loadable module and parses.
+  # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
+  # module and parses SRT + TTML (the TTML path goes through Expat).
   e2isubparser:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -37,25 +57,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: install python dev headers
         run: sudo apt-get update && sudo apt-get -y install python3-dev
-      - name: build _subparser.so
-        working-directory: e2isubparser
-        run: |
-          set -eux
-          EXPAT_DIR=src/expat
-          [ -d "$EXPAT_DIR" ] || EXPAT_DIR=src/expat-2.2.0
-          PYINC=$(python3 -c 'import sysconfig; print("-I"+sysconfig.get_path("include"))')
-          gcc -shared -fPIC -O2 -w -std=gnu11 \
-              -Wno-error=implicit-function-declaration -Wno-error=implicit-int \
-              -DNDEBUG -DHAVE_EXPAT_CONFIG_H -DMAJOR_VERSION=0 -DMINOR_VERSION=5 \
-              -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE \
-              -Isrc/vlc/include -Isrc/ffmpeg/include -I"$EXPAT_DIR" \
-              -Isrc/ttml/include -Isrc/html/include $PYINC \
-              src/subparsermodule.c \
-              src/vlc/src/subtitle.c \
-              src/ffmpeg/src/htmlsubtitles.c \
-              "$EXPAT_DIR"/xmlparse.c "$EXPAT_DIR"/xmlrole.c "$EXPAT_DIR"/xmltok.c \
-              src/ttml/src/*.c src/html/src/*.c \
-              -o _subparser.so
+      - name: make
+        run: make -C e2isubparser CFLAGS="-w"
       - name: parse SRT and TTML (exercises Expat)
         working-directory: e2isubparser
         run: |
@@ -87,12 +90,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: compile
+      - name: make
         run: |
           set -eux
-          gcc -O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE=1 cmdwrap/src/*.c -o cmdwrap_bin
-          gcc -O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE=1 lsdir/src/*.c   -o lsdir_bin
-          ./lsdir_bin . >/dev/null
+          make -C cmdwrap
+          make -C lsdir
+          ./lsdir/lsdir . >/dev/null
 
   # f4mdump (Adobe HDS / RTMP, Flash era) is intentionally not built here:
   # it has no build file in the repo, pulls in a vendored librtmp, and the
