@@ -8,32 +8,39 @@
 #ifndef _MSC_VER
 #include <unistd.h>
 #else
-#include <getopt.h>
+#include "..\msvc\win\getopt.h"
 #endif
 
 #include "misc.h"
 #include "msg.h"
+#include "hls.h"
 
 struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.26\n");
-    printf("(c) 2017-2019 @selsta, samsamsam@o2.pl\n");
-    printf("Usage: %s url [options]\n\n"
-           "-b ... Automaticly choose the best quality.\n"
+    printf("hlsdl v0.27\n");
+    printf("(c) 2017-2020 @selsta, samsamsam@o2.pl\n");
+    printf("Usage: %s [options] url\n\n"
+           "-b ... Automatically choose the best quality.\n"
+           "-W ... Choose largest width lower or equal than this.\n"
+           "-H ... Choose largest height lower or equal than this.\n"
+           "-A ... Select audio language.\n"
            "-v ... Verbose more information.\n"
-           "-o ... Choose name of output file.\n"
+           "-o ... Choose name of output file (\"-\" alias for stdout).\n"
            "-u ... Set custom HTTP User-Agent header.\n"
            "-h ... Set custom HTTP header.\n"
            "-p ... Set proxy uri.\n"
            "-k ... Allow to replace part of AES key uri - old.\n"
            "-n ... Allow to replace part of AES key uri - new.\n"
            "-f ... Force overwriting the output file.\n"
+           "-F ... Force ignore detection of DRM.\n"
+           "-K ... Force AES key value (hexstring)\n"
            "-q ... Print less to the console.\n"
            "-d ... Print the openssl decryption command.\n"
            "-t ... Print the links to the .ts files.\n"
            "-s ... Set live start offset in seconds.\n"
+           "-i ... Set live stream download duration in seconds.\n"
            "-e ... Set refresh delay in seconds.\n"
            "-r ... Set max retries at open.\n"
            "-w ... Set max download segment retries.\n"
@@ -48,9 +55,9 @@ int parse_argv(int argc, char * const argv[])
     int ret = 0;
     int c = 0;
     int custom_header_idx = 0;
-    while ( (c = getopt(argc, argv, "bvqbfctdo:u:h:s:r:w:e:p:k:n:a:C:")) != -1) 
+    while ( (c = getopt(argc, argv, "bH:W:A:vqbfFK:ctdo:u:h:s:i:r:w:e:p:k:n:a:C:")) != -1)
     {
-        switch (c) 
+        switch (c)
         {
         case 'v':
             hls_args.loglevel += 1;
@@ -61,6 +68,15 @@ int parse_argv(int argc, char * const argv[])
         case 'b':
             hls_args.use_best = true;
             break;
+        case 'W':
+            hls_args.maxwidth = atoi(optarg);
+            break;
+        case 'H':
+            hls_args.maxheight = atoi(optarg);
+            break;
+        case 'A':
+            hls_args.audiolang = optarg;
+            break;
         case 'h':
             if (custom_header_idx < HLSDL_MAX_NUM_OF_CUSTOM_HEADERS) {
                 hls_args.custom_headers[custom_header_idx] = optarg;
@@ -70,8 +86,21 @@ int parse_argv(int argc, char * const argv[])
         case 'f':
             hls_args.force_overwrite = true;
             break;
+        case 'F':
+            hls_args.force_ignoredrm = true;
+            break;
+        case 'K':
+            hls_args.key_value = malloc(KEYLEN);
+            if (strlen(optarg) != 2*KEYLEN || str_to_bin(hls_args.key_value, optarg, KEYLEN)) {
+                MSG_ERROR("AES key value : 32 characters hexstring expected\n", c);
+                ret = -1;
+            }
+            break;
         case 's':
             hls_args.live_start_offset_sec = atoi(optarg);
+            break;
+        case 'i':
+            hls_args.live_duration_sec = atoi(optarg);
             break;
         case 'e':
             hls_args.refresh_delay_sec = atoi(optarg);
@@ -83,7 +112,10 @@ int parse_argv(int argc, char * const argv[])
             hls_args.segment_download_retries = atoi(optarg);
             break;
         case 'o':
-            hls_args.filename = optarg;
+            if(strlen(optarg) < MAX_FILENAME_LEN)
+                hls_args.filename = optarg;
+            else
+                MSG_PRINT("Output filename is too long. Using default filename instead.\n");
             break;
         case 't':
             hls_args.dump_ts_urls = true;
@@ -117,14 +149,14 @@ int parse_argv(int argc, char * const argv[])
             ret = -1;
         }
     }
-    
-    if (0 == ret && (optind+1) == argc) 
+
+    if (0 == ret && (optind+1) == argc)
     {
         ret = 0;
         hls_args.url = argv[optind];
         return 0;
     }
-    
+
     print_help(argv[0]);
     return 1;
 }

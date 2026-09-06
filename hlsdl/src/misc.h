@@ -1,5 +1,5 @@
-#ifndef __HLS_DownLoad__misc__
-#define __HLS_DownLoad__misc__
+#ifndef __hlsdl__misc__
+#define __hlsdl__misc__
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,6 +9,7 @@ extern "C" {
 #include <stdbool.h>
 
 #define STRLEN_BTS(LEN) (((LEN) * 2) + 2)
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
 
 #define MAX_FILENAME_LEN 256
 #define MAX_URL_LEN 2048
@@ -28,11 +29,16 @@ typedef struct ByteBuffer {
 struct hls_args {
     int loglevel;
     bool use_best;
+    int maxwidth;
+    int maxheight;
+    char *audiolang;
     int skip_encryption;
     bool force_overwrite;
+    bool force_ignoredrm;
     bool dump_ts_urls;
     bool dump_dec_cmd;
     int live_start_offset_sec;
+    int live_duration_sec;
     int refresh_delay_sec;
     int segment_download_retries;
     int open_max_retries;
@@ -44,6 +50,7 @@ struct hls_args {
     char *(custom_headers[HLSDL_MAX_NUM_OF_CUSTOM_HEADERS]);
     char *key_uri_replace_old;
     char *key_uri_replace_new;
+    uint8_t *key_value;
     char *cookie_file;
     void *cookie_file_mutex;
     bool accept_partial_content;
@@ -60,4 +67,4 @@ char *repl_str(const char *str, const char *from, const char *to);
 }
 #endif
 
-#endif /* defined(__HLS_DownLoad__misc__) */
+#endif /* defined(__hlsdl__misc__) */

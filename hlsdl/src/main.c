@@ -21,6 +21,14 @@
 #include "msg.h"
 #include "misc.h"
 
+char* str_ecryption_type[] ={
+    "NONE",
+    "AES-128",
+    "SAMPLE-AES",
+    "SAMPLE-AES-CTR",
+};
+
+
 static size_t priv_write(const uint8_t *data, size_t len, void *opaque) {
     return fwrite(data, 1, len, opaque);
 }
@@ -113,6 +121,7 @@ static bool get_data_with_retry(char *url, char **hlsfile_source, char **finall_
 
     if (http_code != 200) {
         MSG_API("{\"error_code\":%d, \"error_msg\":\"\"}\n", (int)http_code);
+        return false;
     }
 
     if (size == 0) {
@@ -128,8 +137,12 @@ int main(int argc, char *argv[])
     hls_args.loglevel = 0;
     hls_args.segment_download_retries = HLSDL_MAX_RETRIES;
     hls_args.live_start_offset_sec = HLSDL_LIVE_START_OFFSET_SEC;
+    hls_args.live_duration_sec = HLSDL_LIVE_DURATION;
     hls_args.open_max_retries = HLSDL_OPEN_MAX_RETRIES;
     hls_args.refresh_delay_sec = -1;
+    hls_args.maxwidth = -1;
+    hls_args.maxheight = -1;
+    hls_args.audiolang = NULL;
 
     if (parse_argv(argc, argv)) {
         MSG_WARNING("No files passed. Exiting.\n");
@@ -180,6 +193,30 @@ int main(int argc, char *argv[])
                 me = me->next;
             }
             MSG_VERBOSE("Choosing best quality. (Bitrate: %d), (Resolution: %s), (Codecs: %s)\n", selected->bitrate, selected->resolution, selected->codecs);
+        } else if (hls_args.maxwidth > -1 || hls_args.maxheight > -1) {
+            int width, maxwidth = 0;
+            int height, maxheight = 0;
+            hls_media_playlist_t *me;
+            for (me = master_playlist.media_playlist; me; me = me->next) {
+                if (sscanf(me->resolution, "%dx%d", &width, &height) < 2)
+                    break;
+                if (width > hls_args.maxwidth && hls_args.maxwidth != -1)
+                    continue;
+                if (height > hls_args.maxheight && hls_args.maxheight != -1)
+                    continue;
+                if (selected == NULL ||
+                    ((hls_args.maxwidth == -1 || width > maxwidth) &&
+                     (hls_args.maxheight == -1 || height > maxheight))) {
+                    selected = me;
+                    maxwidth = width;
+                    maxheight = height;
+                }
+            }
+            if (selected == NULL) {
+                MSG_ERROR("No resolution match found\n");
+                exit(1);
+            }
+            MSG_VERBOSE("Choosing by resolution. (Bitrate: %d), (Resolution: %s), (Codecs: %s)\n", selected->bitrate, selected->resolution, selected->codecs);
         } else {
             // print hls master playlist
             int i = 1;
@@ -229,6 +266,7 @@ int main(int argc, char *argv[])
                         selected_audio = audio;
                     }
                 }
+                audio = audio->next;
             }
 
             if (has_audio_playlist) {
@@ -237,32 +275,40 @@ int main(int argc, char *argv[])
                 int i = 1;
 
                 if (!selected_audio) {
-                    if (!hls_args.use_best) {
+                    if (hls_args.use_best || hls_args.audiolang) {
+                        i = 0;
                         audio = master_playlist.audio;
                         while (audio) {
                             if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                                MSG_PRINT("%d: Name: %s, Language: %s\n", i, audio->name, audio->lang ? audio->lang : "unknown");
-                                i += 1;
+                                if (hls_args.use_best && audio->is_default) {
+                                    audio_choice = i;
+                                    break;
+                                }
+                                if (hls_args.audiolang && audio->lang && 0 == strcmp(audio->lang, hls_args.audiolang)) {
+                                    audio_choice = i;
+                                    break;
+                                }
                             }
+                            i += 1;
+                            audio = audio->next;
+                        }
+                    }
+
+                    if (audio_choice == 0) {
+                        audio = master_playlist.audio;
+                        i = 0;
+                        while (audio) {
+                            if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
+                                MSG_PRINT("%d: Name: %s, Language: %s\n", i, audio->name, audio->lang ? audio->lang : "unknown");
+                            }
+                            i += 1;
                             audio = audio->next;
                         }
 
                         MSG_PRINT("Which Language should be downloaded? ");
-                        if (scanf("%d", &audio_choice) != 1 || audio_choice <= 0 || audio_choice >= i) {
+                        if (scanf("%d", &audio_choice) != 1 || audio_choice < 0 || audio_choice >= i) {
                             MSG_ERROR("Wrong input!\n");
                             exit(1);
-                        }
-                    } else {
-                        audio_choice = 1;
-                        i = 0;
-                        audio = master_playlist.audio;
-                        while (audio) {
-                            if (0 == strcmp(audio->grp_id, selected->audio_grp) && audio->is_default) {
-                                i += 1;
-                                audio_choice = i;
-                                break;
-                            }
-                            audio = audio->next;
                         }
                     }
 
@@ -270,12 +316,12 @@ int main(int argc, char *argv[])
                     audio = master_playlist.audio;
                     while (audio) {
                         if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                            i += 1;
                             if (i == audio_choice) {
                                 selected_audio = audio;
                                 break;
                             }
                         }
+                        i += 1;
                         audio = audio->next;
                     }
 
@@ -333,10 +379,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (media_playlist.encryption) {
-        MSG_PRINT("HLS Stream is %s encrypted.\n",
-                  media_playlist.encryptiontype == ENC_AES128 ? "AES-128" : "SAMPLE-AES");
-    }
+    MSG_PRINT("HLS Stream is %s encrypted.\n",
+                  str_ecryption_type[media_playlist.encryptiontype]);
 
     MSG_VERBOSE("Media Playlist parsed successfully.\n");
 
