@@ -1,0 +1,99 @@
+name: build deps
+
+on: [push, pull_request]
+
+jobs:
+  # ------------------------------------------------------------------ hlsdl
+  # Linux only - the deps feed is always cross-compiled for Linux and the
+  # bundled makefile has no macOS openssl handling.
+  hlsdl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: install libcurl / libcrypto
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev
+      - name: make
+        run: make -C hlsdl
+      - name: TS stream (AES-128, muxed)
+        run: |
+          timeout 180 ./hlsdl/hlsdl -b -o test.ts "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
+          echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | sha256sum -c
+      # Needs the current hlsdl (EXT-X-MAP support). Against the old bundled
+      # 0.26 this step fails - that is the point.
+      - name: fMP4 stream (EXT-X-MAP + BYTERANGE)
+        run: |
+          timeout 180 ./hlsdl/hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
+          test -s test_fmp4.mp4
+          dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+
+  # ---------------------------------------------------------- e2isubparser
+  # Old C (VLC / ffmpeg snippets from ~2015); build permissively on an
+  # older toolchain. Goal: it links into a loadable module and parses.
+  e2isubparser:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: install python dev headers
+        run: sudo apt-get update && sudo apt-get -y install python3-dev
+      - name: build _subparser.so
+        working-directory: e2isubparser
+        run: |
+          set -eux
+          EXPAT_DIR=src/expat
+          [ -d "$EXPAT_DIR" ] || EXPAT_DIR=src/expat-2.2.0
+          PYINC=$(python3 -c 'import sysconfig; print("-I"+sysconfig.get_path("include"))')
+          gcc -shared -fPIC -O2 -w -std=gnu11 \
+              -Wno-error=implicit-function-declaration -Wno-error=implicit-int \
+              -DNDEBUG -DHAVE_EXPAT_CONFIG_H -DMAJOR_VERSION=0 -DMINOR_VERSION=5 \
+              -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE \
+              -Isrc/vlc/include -Isrc/ffmpeg/include -I"$EXPAT_DIR" \
+              -Isrc/ttml/include -Isrc/html/include $PYINC \
+              src/subparsermodule.c \
+              src/vlc/src/subtitle.c \
+              src/ffmpeg/src/htmlsubtitles.c \
+              "$EXPAT_DIR"/xmlparse.c "$EXPAT_DIR"/xmlrole.c "$EXPAT_DIR"/xmltok.c \
+              src/ttml/src/*.c src/html/src/*.c \
+              -o _subparser.so
+      - name: parse SRT and TTML (exercises Expat)
+        working-directory: e2isubparser
+        run: |
+          python3 - <<'PY'
+          import _subparser
+          print("version:", _subparser.version())
+
+          srt = "1\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
+          r = _subparser.parse(srt, 0, 1, 1, 12, 138)
+          print("srt:", r)
+          assert r, "SRT parse returned nothing"
+
+          ttml = (
+              '<?xml version="1.0" encoding="UTF-8"?>'
+              '<tt xmlns="http://www.w3.org/ns/ttml">'
+              '<body><div>'
+              '<p begin="00:00:01.000" end="00:00:03.000">Ampersand &amp; entity</p>'
+              '<p begin="00:00:04.000" end="00:00:06.000">second cue</p>'
+              '</div></body></tt>'
+          )
+          r = _subparser.parse(ttml, 0, 1, 1, 12, 138)
+          print("ttml:", r)
+          assert r, "TTML parse returned nothing"
+          PY
+
+  # ----------------------------------------------------------- cmdwrap / lsdir
+  small-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile
+        run: |
+          set -eux
+          gcc -O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE=1 cmdwrap/src/*.c -o cmdwrap_bin
+          gcc -O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE=1 lsdir/src/*.c   -o lsdir_bin
+          ./lsdir_bin . >/dev/null
+
+  # f4mdump (Adobe HDS / RTMP, Flash era) is intentionally not built here:
+  # it has no build file in the repo, pulls in a vendored librtmp, and the
+  # protocol is long dead. Add a job if it is ever touched again.
