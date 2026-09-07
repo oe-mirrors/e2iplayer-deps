@@ -30,7 +30,7 @@ INCLUDES = -Isrc/vlc/include -Isrc/ffmpeg/include -I$(EXPATDIR) \
 
 override CFLAGS += -Os -fPIC -fno-strict-aliasing \
                    -ffunction-sections -fdata-sections \
-                   -DNDEBUG -DHAVE_EXPAT_CONFIG_H -DMAJOR_VERSION=0 -DMINOR_VERSION=5 \
+                   -DNDEBUG -DHAVE_EXPAT_CONFIG_H \
                    -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE
 override LDFLAGS += -Wl,--gc-sections
 

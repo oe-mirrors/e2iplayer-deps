@@ -143,6 +143,10 @@ jobs:
         run: make -C e2isubparser CFLAGS="-w"
       - name: parse SRT and TTML (exercises Expat)
         working-directory: e2isubparser
+        env:
+          # abort + report on any heap corruption, so the huge-cue test below
+          # fails loudly if the markup buffer ever overflows again
+          MALLOC_CHECK_: "3"
         run: |
           python3 - <<'PY'
           import _subparser
@@ -164,6 +168,16 @@ jobs:
           r = _subparser.parse(ttml, 0, 1, 1, 12, 138)
           print("ttml:", r)
           assert r, "TTML parse returned nothing"
+
+          # a single cue far longer than the internal markup buffer, with
+          # lots of <b>/<font> tags and unterminated '<' - must not overflow
+          huge = ("1\n00:00:01,000 --> 00:00:05,000\n"
+                  + ("<b>x</b> <font size=\"20\">y</font> z <<<< " * 400)
+                  + "\n\n")
+          r = _subparser.parse(huge, 0, 1, 1, 12, 138)
+          print("huge cue len:", len(r["list"][0]["text"]))
+          assert r["list"], "huge SRT parse returned nothing"
+          assert len(r["list"][0]["text"]) < 4096, "markup buffer not bounded"
           PY
 
   # ----------------------------------------------------------- cmdwrap / lsdir

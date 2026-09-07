@@ -21,6 +21,10 @@
 #ifndef IPTV_AVCODEC_HTMLSUBTITLES_H
 #define IPTV_AVCODEC_HTMLSUBTITLES_H
 
-void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in);
+#include <stddef.h>
+
+/* Converts SubRip / SAMI style markup to ASS. Writes at most dst_size-1
+ * bytes into dst plus a terminating NUL; excess input is dropped. */
+void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, size_t dst_size, const char *in);
 
 #endif /* AVCODEC_HTMLSUBTITLES_H */
