@@ -1,85 +1,154 @@
-# lsdir
-Allows to list directory
+# e2iplayer-deps
 
-# cmdwrap
-Command line args splitter
+Native helper binaries and the C subtitle parser bundled with
+[E2iPlayer](https://github.com/oe-mirrors/e2iplayer). Shipped as the
+`enigma2-plugin-extensions-e2iplayer-deps` package, built from the
+OE/OpenATV feed recipe.
 
-# e2isubparser
-Python module for text subtitles parsing
+## Github status
 
-# hlsdl
-==============
+[![build deps](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/ci.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/ci.yml)
+[![hygiene](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/hygiene.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/hygiene.yml)
+[![Tag on version change](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/tag_release.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/tag_release.yml)
+[![Github last commit](https://img.shields.io/github/last-commit/oe-mirrors/e2iplayer-deps)](https://github.com/oe-mirrors/e2iplayer-deps/commits)
+[![GitHub Activity](https://img.shields.io/github/commit-activity/y/oe-mirrors/e2iplayer-deps.svg?label=commits)](https://github.com/oe-mirrors/e2iplayer-deps/commits)
+[![Issues](https://img.shields.io/github/issues/oe-mirrors/e2iplayer-deps?color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/issues)
+![Platform](https://img.shields.io/badge/Platform-Enigma2-orange.svg)
 
-This program converts .m3u8 playlists (using fragmented MPEG-2 Transport Streams) to a .ts video. It supports decryption of both AES-128 and SAMPLE-AES encryption.
+**Component versions**
 
-Requirements
-------------
+[![hlsdl](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=hlsdl-*&label=hlsdl&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=hlsdl)
+[![e2isubparser](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=e2isubparser-*&label=e2isubparser&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=e2isubparser)
+[![lsdir](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=lsdir-*&label=lsdir&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=lsdir)
+[![cmdwrap](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=cmdwrap-*&label=cmdwrap&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=cmdwrap)
+[![f4mdump](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=f4mdump-*&label=f4mdump&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=f4mdump)
 
-This program requires libcurl and libcrypto libraries.
+The version badges fill in once `tag_release.yml` has run on master (it
+tags `<component>-v<version>` from each component's own version string).
 
-Build
------
-Linux:
-`make && make install && make clean`
+## SonarCloud status
 
-Windows:
-https://github.com/samsamsam-iptvplayer/hlsdl/blob/master/msvc/BUID_WINDOWS.txt
+Fills in once a `SONAR_TOKEN` secret is added and the project is created
+at sonarcloud.io (org `oe-mirrors`, key `oe-mirrors_e2iplayer-deps`) - see
+the header of `.github/workflows/sonarcloud.yml`.
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=bugs)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Duplicated Lines (%)](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=oe-mirrors_e2iplayer-deps&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
 
-Usage and Options
--------
-`./hlsdl url [options]`
+[![SonarQube Cloud](https://sonarcloud.io/images/project_badges/sonarcloud-light.svg)](https://sonarcloud.io/summary/new_code?id=oe-mirrors_e2iplayer-deps)
 
----------------------------
+---
+
+See [BUILDING.md](BUILDING.md) for how to build the components outside the
+OE feed.
+
+---
+
+## lsdir
+
+Fast directory lister used by the plugin's file browser. `lsdir --version`
+prints the version string.
+
+## cmdwrap
+
+Command-line argument splitter.
+
+## e2isubparser
+
+Python C-extension for text subtitle parsing (SRT / SSA / TTML / EBU-TT).
+The TTML path uses a vendored [Expat](https://libexpat.github.io/).
+
+## f4mdump
+
+Simple F4M / HDS (Adobe HTTP Dynamic Streaming) dumper. It shells out to
+`wget` for the transfers rather than linking an HTTP library.
+
+```
+List bitrates:  f4mdump "/path/to/wget [extra params]" "http://url.to/Manifest.f4m"
+Download:       f4mdump "/path/to/wget [extra params]" "http://url.to/Manifest.f4m" "/path/to/outfile" [bitrate]
+```
+
+## hlsdl
+
+Downloads VOD and live HLS (`.m3u8`) streams to a single file. Handles
+MPEG-2 Transport Stream and fragmented MP4 / CMAF segments, `EXT-X-MAP`
+initialization segments (fMP4 and TS), `EXT-X-BYTERANGE`, discontinuities,
+and AES-128 / SAMPLE-AES decryption.
+
+Requires `libcurl` and `libcrypto`.
+
+```
+Linux:    make && make install && make clean
+Windows:  hlsdl/msvc/BUID_WINDOWS.txt
+```
+
+### Usage
+
+`hlsdl [options] url`
+
 ```
 -b ... Automatically choose the best quality.
-
+-W ... Choose largest width lower or equal than this.
+-H ... Choose largest height lower or equal than this.
+-A ... Select audio language.
 -v ... Verbose more information.
-
--o ... Choose name of output file ("-" alias for stdout).
-
--u ... Set custom HTTP User-Agent header.
-
--h ... Set custom HTTP header.
-
--p ... Set proxy uri.
-
--k ... Allow to replace part of AES key uri - old.
-
--n ... Allow to replace part of AES key uri - new.
-
--f ... Force overwriting the output file.
-
 -q ... Print less to the console.
-
+-o ... Choose name of output file ("-" alias for stdout).
+-f ... Force overwriting the output file.
+-F ... Force ignore detection of DRM.
+-u ... Set custom HTTP User-Agent header.
+-h ... Set custom HTTP header.
+-p ... Set proxy uri.
+-C ... Cookie file (old Netscape / Mozilla format).
+-k ... Allow to replace part of AES key uri - old.
+-n ... Allow to replace part of AES key uri - new.
+-K ... Force AES key value (hexstring).
 -d ... Print the openssl decryption command.
-
 -t ... Print the links to the .ts files.
-
 -s ... Set live start offset in seconds.
-
+-i ... Set live stream download duration in seconds.
 -e ... Set refresh delay in seconds.
-
 -r ... Set max retries at open.
-
 -w ... Set max download segment retries.
-
 -a ... Set additional url to the audio media playlist.
+-c ... Treat HTTP 206 as 200 even without a range request.
 ```
 
-ToDo
------
-* support for Fragmented MPEG-4 playlist
-* support for EXT-X-MAP in the MPEG-2 Transport Streams playlist
+Not handled (E2iPlayer routes these through its own ffmpeg/gstreamer
+pipeline): Widevine / PlayReady / FairPlay (CENC / cbcs), real muxing, and
+bit-exact remuxing across codec parameter changes.
 
-# F4MDump
-Info:
-Simple F4M/HDS (Adobe HTTP Dynamic Streaming) dumper. Intended to be used by IPTVPlayer plugin: https://gitorious.org/iptv-pl-dla-openpli, http://iptvplayer.vline.pl.
+---
 
-For downloading data with URL syntax F4MDump do not use any library it use wget, called as child process using vfor/execvp.
+### 📜 License Information [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-Usage:
-List available bitrates from manifest file: F4MDump "/path/to/wget with additional params if needed" "http://url.to/Manifest.f4m"
+This repository ships more than one license:
 
-Downloading: F4MDump "/path/to/wget with additional params if needed" "http://url.to/Manifest.f4m" "/path/to/out/file" [bitrate]
+| Component | License |
+|---|---|
+| `hlsdl` | MIT — see [hlsdl/LICENSE](hlsdl/LICENSE) |
+| `lsdir`, `cmdwrap`, `e2isubparser`, `f4mdump` | GPLv3, released as part of [E2iPlayer](https://github.com/oe-mirrors/e2iplayer) — see its [LICENSE.txt](https://github.com/oe-mirrors/e2iplayer/blob/python3/LICENSE.txt) |
+| vendored Expat (in `e2isubparser`) | MIT |
+| vendored VLC / FFmpeg subtitle snippets (in `e2isubparser`) | LGPL 2.1+ |
+| vendored librtmp (in `f4mdump`) | LGPL 2.1 — see [f4mdump/ext/librtmp/COPYING](f4mdump/ext/librtmp/COPYING) |
+| vendored TinyXML-2 (in `f4mdump`) | zlib |
 
+The E2iPlayer-authored components are free software; you can redistribute
+them and/or modify them under the terms of the GNU General Public License
+as published by the Free Software Foundation. Vendored third-party code
+keeps its own upstream license.
+
+<img width="127" height="51" alt="GPLv3 logo" src="https://www.gnu.org/graphics/gplv3-127x51.png" />
+
+---
+
+### 🤝 Contributing
+
+Pull requests welcome. Fork, branch, commit with a clear message, open a
+PR. CI (`build deps`, `hygiene`) runs on every push and PR.
