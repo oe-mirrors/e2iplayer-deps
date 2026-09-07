@@ -22,6 +22,7 @@ CFLAGS+=-Wall -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+=-Wmissing-declarations -Wshadow -Wpointer-arith -Wcast-qual
 CFLAGS+=-Wsign-compare -Iincludes
 CFLAGS+=-DPREFIX='"$(PREFIX)"'
+CFLAGS+=-D_FILE_OFFSET_BITS=64
 
 ifeq ("$(OSNAME)", "mingw32")
 	LDFLAGS+=-Wl,-Bstatic -lpthread -lcurl  -lssl -lcrypto -lwsock32 -lws2_32 -lwldap32 -lz

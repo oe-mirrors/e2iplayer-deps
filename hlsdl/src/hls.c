@@ -10,6 +10,7 @@
 #if !defined(__APPLE__) && !defined(__MINGW32__) && !defined(__CYGWIN__)
 #include <sys/prctl.h>
 #endif
+#include <sys/types.h>   /* off_t for ftello() in resume_checkpoint() */
 #include <unistd.h>
 #else
 #include <Windows.h>
@@ -1768,15 +1769,26 @@ uint8_t * find_first_ts_packet(ByteBuffer_t *buf) {
     return NULL;
 }
 
-/* Persist resume progress after a media segment. Flush the output first so
- * the sidecar never claims bytes that are still in the stdio buffer. */
+/* Persist resume progress after a media segment. Flush the output, then take
+ * the byte count from the real file position rather than a running counter -
+ * that way a miscount anywhere in the writer (e.g. a short write counted in
+ * full) cannot desync the sidecar from the file. */
 static void resume_checkpoint(hls_resume_state_t *resume, write_ctx_t *out_ctx, int done, int64_t bytes)
 {
     if (!resume) {
         return;
     }
     if (out_ctx && out_ctx->opaque) {
-        fflush((FILE *)out_ctx->opaque);
+        FILE *f = (FILE *)out_ctx->opaque;
+        fflush(f);
+#ifdef _MSC_VER
+        __int64 pos = _ftelli64(f);
+#else
+        off_t pos = ftello(f);
+#endif
+        if (pos >= 0) {
+            bytes = (int64_t)pos;
+        }
     }
     resume_save(resume, done, bytes);
 }
@@ -1827,9 +1839,11 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         return 0;
     }
 
-    /* Fast-forward the segment cursor(s) past what a previous run already
-     * wrote, mirroring the main loop's pointer advancement exactly but
-     * without fetching or writing anything. */
+    /* Fast-forward past the media segments a previous run already wrote,
+     * without fetching or writing anything. The video cursor is the one that
+     * matters; the TS+merge path keeps the audio cursor in lockstep with it
+     * (as the main loop does), and the fMP4 path does not use the audio
+     * cursor at all. */
     if (resume && resume->done > 0) {
         int skipped = 0;
         while (ms && skipped < resume->done) {

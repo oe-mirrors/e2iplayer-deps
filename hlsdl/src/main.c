@@ -1,11 +1,8 @@
-/* Must precede every system header: _GNU_SOURCE exposes ftruncate(), and
- * 64-bit off_t keeps the resume path correct for >2 GB output files on
- * 32-bit boxes. */
+/* Must precede every system header so <unistd.h> exposes ftruncate(). The
+ * makefile and the OE recipe also pass -D_FILE_OFFSET_BITS=64 (build-wide, so
+ * ftello()/off_t are 64-bit in every translation unit, not just this one). */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#endif
-#ifndef _FILE_OFFSET_BITS
-#define _FILE_OFFSET_BITS 64
 #endif
 
 #ifndef _MSC_VER
@@ -58,6 +55,41 @@ static bool is_file_exists(const char *filename)
 #endif
 }
 
+/* FNV-1a over the media segment list - each segment's URL and byte range,
+ * video then audio. Two quality variants of the same VOD almost always have
+ * the same segment count, so this is what actually tells a resume run that
+ * the playlist it was handed is a different one. */
+static uint64_t fnv1a(uint64_t h, const void *data, size_t len)
+{
+    const unsigned char *p = data;
+    while (len--) {
+        h ^= *p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t playlist_fingerprint(const hls_media_playlist_t *me, const hls_media_playlist_t *audio)
+{
+    uint64_t h = 14695981039346656037ULL;   /* FNV-1a 64-bit offset basis */
+    for (int pass = 0; pass < 2; pass++) {
+        const hls_media_playlist_t *pl = pass ? audio : me;
+        if (!pl) {
+            continue;
+        }
+        for (const struct hls_media_segment *s = pl->first_media_segment; s; s = s->next) {
+            if (s->url) {
+                h = fnv1a(h, s->url, strlen(s->url));
+            }
+            h = fnv1a(h, &s->offset, sizeof(s->offset));
+            h = fnv1a(h, &s->size, sizeof(s->size));
+            h = fnv1a(h, &s->is_map, sizeof(s->is_map));
+        }
+        h ^= 0x9e3779b97f4a7c15ULL;   /* separate the video and audio runs */
+    }
+    return h;
+}
+
 static FILE* get_output_file(bool resuming)
 {
     FILE *pFile = NULL;
@@ -85,12 +117,8 @@ static FILE* get_output_file(bool resuming)
         fflush(stdout);
     } else {
         char filename[MAX_FILENAME_LEN];
-        if (hls_args.filename) {
-            strcpy(filename, hls_args.filename);
-        }
-        else {
-            strcpy(filename, "000_hls_output.ts");
-        }
+        snprintf(filename, sizeof(filename), "%s",
+                 hls_args.filename ? hls_args.filename : "000_hls_output.ts");
 
         if (is_file_exists(filename)) {
             if (hls_args.force_overwrite) {
@@ -431,7 +459,9 @@ int main(int argc, char *argv[])
                     total++;
                 }
             }
-            resume = resume_load(hls_args.filename, total, has_map);
+            uint64_t fp = playlist_fingerprint(&media_playlist,
+                              audio_media_playlist.first_media_segment ? &audio_media_playlist : NULL);
+            resume = resume_load(hls_args.filename, total, has_map, fp);
             resuming = (resume && resume->done > 0);
 
             if (resuming) {
@@ -461,9 +491,10 @@ int main(int argc, char *argv[])
             if (0 != trunc_err || 0 != fseek(out_file, 0, SEEK_END)) {
                 MSG_WARNING("resume: cannot position the output - starting fresh\n");
                 fclose(out_file);
-                remove(hls_args.filename);
                 resume->done = 0;
                 resume->bytes = 0;
+                /* Leave the partial file in place; get_output_file() overwrites
+                 * it under -f, or asks, rather than deleting it here. */
                 out_file = get_output_file(false);
             }
         }

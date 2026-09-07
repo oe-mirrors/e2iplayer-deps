@@ -22,7 +22,7 @@ struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.30\n");
+    printf("hlsdl v0.31\n");
     printf("(c) 2017-2026 @selsta, samsamsam@o2.pl\n");
     printf("Usage: %s [options] url\n\n"
            "-b ... Automatically choose the best quality.\n"
@@ -173,16 +173,16 @@ static void resume_sidecar_path(char *dst, size_t dst_sz, const char *base)
     snprintf(dst, dst_sz, "%s%s", base, RESUME_SUFFIX);
 }
 
-hls_resume_state_t *resume_load(const char *out_filename, int total, int has_map)
+hls_resume_state_t *resume_load(const char *out_filename, int total, int has_map, uint64_t fingerprint)
 {
     hls_resume_state_t *rs = calloc(1, sizeof(*rs));
     if (!rs) {
         return NULL;
     }
     snprintf(rs->out_filename, sizeof(rs->out_filename), "%s", out_filename);
-    rs->total = total;
-    rs->map   = has_map;   /* recorded in the sidecar; the resume run rejects a
-                              playlist whose fMP4-init state no longer matches */
+    rs->total       = total;
+    rs->map         = has_map;
+    rs->fingerprint = fingerprint;
 
     char path[MAX_FILENAME_LEN + 32];
     resume_sidecar_path(path, sizeof(path), out_filename);
@@ -194,6 +194,7 @@ hls_resume_state_t *resume_load(const char *out_filename, int total, int has_map
 
     int ver = 0, ftotal = -1, fdone = -1, fmap = -1;
     long long fbytes = -1;
+    unsigned long long ffp = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (sscanf(line, "hlsdl-resume %d", &ver) == 1) continue;
@@ -201,15 +202,16 @@ hls_resume_state_t *resume_load(const char *out_filename, int total, int has_map
         if (sscanf(line, "done %d", &fdone) == 1) continue;
         if (sscanf(line, "bytes %lld", &fbytes) == 1) continue;
         if (sscanf(line, "map %d", &fmap) == 1) continue;
+        if (sscanf(line, "fingerprint %llx", &ffp) == 1) continue;
     }
     fclose(f);
 
-    if (ver != 1) {
+    if (ver != 2) {
         MSG_WARNING("resume: unrecognized sidecar - starting fresh\n");
         return rs;
     }
-    if (ftotal != total || fmap != has_map) {
-        MSG_WARNING("resume: the playlist changed (%d -> %d segments) - starting fresh\n", ftotal, total);
+    if (ftotal != total || fmap != has_map || (uint64_t)ffp != fingerprint) {
+        MSG_WARNING("resume: this playlist does not match the sidecar - starting fresh\n");
         return rs;
     }
     if (fdone < 0 || fdone > total || fbytes < 0) {
@@ -243,12 +245,13 @@ void resume_save(hls_resume_state_t *rs, int done, int64_t bytes)
         return;
     }
     fprintf(f,
-            "hlsdl-resume 1\n"
+            "hlsdl-resume 2\n"
             "total %d\n"
             "done %d\n"
             "bytes %" PRId64 "\n"
-            "map %d\n",
-            rs->total, rs->done, rs->bytes, rs->map);
+            "map %d\n"
+            "fingerprint %016" PRIx64 "\n",
+            rs->total, rs->done, rs->bytes, rs->map, rs->fingerprint);
     fflush(f);
     fclose(f);
 #ifdef _MSC_VER

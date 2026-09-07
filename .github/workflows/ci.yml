@@ -172,24 +172,41 @@ jobs:
           test "$n" -ge 4
           # reference: a clean full download
           timeout 60 ../hlsdl/hlsdl -f -o ref.ts rs_full.m3u8
-          # a playlist whose 3rd segment points at a missing file
-          awk 'BEGIN{i=0} /\.ts$/{i++; if(i==3){print "missing.ts"; next}} {print}' rs_full.m3u8 > rs_broken.m3u8
-          # first run stops at the bad segment, leaving out.ts + the sidecar
-          if timeout 60 ../hlsdl/hlsdl -f -R -o out.ts rs_broken.m3u8; then
-            echo "expected the broken run to fail" >&2; exit 1
+          # interrupt without touching the playlist: make the 3rd segment
+          # briefly unreadable (a real interruption is a transfer failure, not
+          # a playlist edit - and a playlist edit is what the fingerprint is
+          # meant to catch)
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          chmod 000 "$seg3"
+          if timeout 60 ../hlsdl/hlsdl -f -R -w 1 -o out.ts rs_full.m3u8; then
+            echo "expected the interrupted run to fail" >&2; exit 1
           fi
           test -s out.ts.hlsdl.resume
+          grep -q '^hlsdl-resume 2$' out.ts.hlsdl.resume
           grep -q '^done 2$' out.ts.hlsdl.resume
-          # resume against the good playlist - must finish and match the reference
+          cp out.ts.hlsdl.resume saved.resume
+          # clear the fault and resume against the same playlist
+          chmod 644 "$seg3"
           timeout 60 ../hlsdl/hlsdl -R -o out.ts rs_full.m3u8
           test ! -e out.ts.hlsdl.resume
           cmp ref.ts out.ts
-          # a sidecar that says "already complete" is a clean no-op
+          # "already complete" no-op: the real sidecar bumped to done == total
           cp ref.ts out2.ts
-          printf 'hlsdl-resume 1\ntotal %d\ndone %d\nbytes %d\nmap 0\n' "$n" "$n" "$(stat -c%s ref.ts)" > out2.ts.hlsdl.resume
+          sed "s/^done .*/done $n/;s/^bytes .*/bytes $(stat -c%s ref.ts)/" saved.resume > out2.ts.hlsdl.resume
           timeout 30 ../hlsdl/hlsdl -R -o out2.ts rs_full.m3u8
           test ! -e out2.ts.hlsdl.resume
           cmp ref.ts out2.ts
+          # a sidecar from a different playlist (same segment count) is refused
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=48x32 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'other%d.ts' other.m3u8
+          test "$(grep -c '\.ts$' other.m3u8)" -eq "$n"
+          timeout 60 ../hlsdl/hlsdl -f -o other_ref.ts other.m3u8
+          cp saved.resume other_out.ts.hlsdl.resume
+          timeout 60 ../hlsdl/hlsdl -f -R -o other_out.ts other.m3u8 2>warn.txt
+          grep -qi 'does not match' warn.txt
+          test ! -e other_out.ts.hlsdl.resume
+          cmp other_ref.ts other_out.ts
       - name: fixture - interrupted fMP4 (EXT-X-MAP) download resumes
         run: |
           set -eux
@@ -201,18 +218,49 @@ jobs:
           m=$(grep -c '\.m4s$' rf_full.m3u8)
           test "$m" -ge 4
           timeout 60 ../hlsdl/hlsdl -f -o rf_ref.mp4 rf_full.m3u8
-          # the EXT-X-MAP line ends in .mp4" so only media segments are rewritten
-          awk 'BEGIN{i=0} /\.m4s$/{i++; if(i==3){print "missing.m4s"; next}} {print}' rf_full.m3u8 > rf_broken.m3u8
-          if timeout 60 ../hlsdl/hlsdl -f -R -o rf_out.mp4 rf_broken.m3u8; then
-            echo "expected the broken fMP4 run to fail" >&2; exit 1
+          seg3=$(grep '\.m4s$' rf_full.m3u8 | sed -n 3p)
+          chmod 000 "$seg3"
+          if timeout 60 ../hlsdl/hlsdl -f -R -w 1 -o rf_out.mp4 rf_full.m3u8; then
+            echo "expected the interrupted fMP4 run to fail" >&2; exit 1
           fi
           grep -q '^map 1$' rf_out.mp4.hlsdl.resume
           grep -q '^done 2$' rf_out.mp4.hlsdl.resume
+          chmod 644 "$seg3"
           timeout 60 ../hlsdl/hlsdl -R -o rf_out.mp4 rf_full.m3u8
           test ! -e rf_out.mp4.hlsdl.resume
           cmp rf_ref.mp4 rf_out.mp4
           # exactly one ftyp: the init segment was not re-written on resume
           test "$(grep -a -o ftyp rf_out.mp4 | wc -l)" -eq 1
+      - name: fixture - interrupted resume on the -a A/V-merge path
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=4:s=128x72 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'mv%d.ts' mv.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=4 -c:a mp2 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'ma%d.ts' ma.m3u8
+          test "$(grep -c '\.ts$' mv.m3u8)" -ge 3
+          timeout 60 ../hlsdl/hlsdl -f -a ma.m3u8 -o mav_ref.ts mv.m3u8
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 mav_ref.ts | sort -u > mav.txt
+          grep -q video mav.txt
+          grep -q audio mav.txt
+          v3=$(grep '\.ts$' mv.m3u8 | sed -n 3p)
+          chmod 000 "$v3"
+          if timeout 60 ../hlsdl/hlsdl -f -R -w 1 -a ma.m3u8 -o mav_out.ts mv.m3u8; then
+            echo "expected the interrupted -a run to fail" >&2; exit 1
+          fi
+          test -s mav_out.ts.hlsdl.resume
+          chmod 644 "$v3"
+          timeout 60 ../hlsdl/hlsdl -R -a ma.m3u8 -o mav_out.ts mv.m3u8
+          test ! -e mav_out.ts.hlsdl.resume
+          # both streams survive the resume splice and the file demuxes cleanly
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 mav_out.ts | sort -u > mav_out.txt
+          grep -q video mav_out.txt
+          grep -q audio mav_out.txt
+          ffprobe -v error -i mav_out.ts -f null -
+
 
   # ---------------------------------------------------------- e2isubparser
   # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
