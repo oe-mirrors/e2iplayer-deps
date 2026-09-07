@@ -14,6 +14,10 @@
 #include <stdint.h>
 #include <errno.h>
 
+#ifndef LSDIR_VERSION
+#define LSDIR_VERSION "1.0"
+#endif
+
 #define BUF_SIZE 1024
 #define handle_error(msg) \
        do { perror(msg); exit(EXIT_FAILURE); } while (0)
@@ -165,6 +169,12 @@ int MatchWildcards(const char *name, char *wildcards, const unsigned int wildcar
 
 int main(int argc, char *argv[])
 {
+    if (2 == argc && (0 == strcmp(argv[1], "--version") || 0 == strcmp(argv[1], "-V")))
+    {
+        printf("lsdir v%s\n", LSDIR_VERSION);
+        return 0;
+    }
+
     int fd = -1;
     int nRead = 0;
     char buffer[BUF_SIZE] = {0};
