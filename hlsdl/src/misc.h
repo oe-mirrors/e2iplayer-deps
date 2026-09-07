@@ -54,9 +54,30 @@ struct hls_args {
     char *cookie_file;
     void *cookie_file_mutex;
     bool accept_partial_content;
+    bool resume;
 };
 
 extern struct hls_args hls_args;
+
+/* VOD resume: a small sidecar file <output>.hlsdl.resume records how far a
+ * download got so an interrupted transfer can carry on instead of starting
+ * over. */
+typedef struct hls_resume_state {
+    char    out_filename[MAX_FILENAME_LEN];
+    int     total;   /* media segments in the playlist (EXT-X-MAP excluded) */
+    int     done;    /* media segments already written */
+    int64_t bytes;   /* bytes already in the output file */
+    int     map;     /* 1 if the fMP4 init segment is already written */
+} hls_resume_state_t;
+
+/* Called only when -R is set. Returns a heap state: done/bytes are 0 for a
+ * fresh start (no valid sidecar, or the playlist changed), non-zero to
+ * resume. Never returns NULL. */
+hls_resume_state_t *resume_load(const char *out_filename, int total, int has_map);
+/* Atomically rewrite the sidecar with the given progress. */
+void resume_save(hls_resume_state_t *rs, int done, int64_t bytes);
+/* Remove the sidecar (call on a completed download). */
+void resume_clear(const char *out_filename);
 
 int str_to_bin(uint8_t *data, char *hexstring, int len);
 int parse_argv(int argc, char * const argv[]);

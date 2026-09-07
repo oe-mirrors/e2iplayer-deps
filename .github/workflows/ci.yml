@@ -161,6 +161,58 @@ jobs:
             echo "hlsdl reported success for an unreachable segment" >&2
             exit 1
           fi
+      - name: fixture - interrupted VOD download resumes to the same bytes
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=64x48 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'rs%d.ts' rs_full.m3u8
+          n=$(grep -c '\.ts$' rs_full.m3u8)
+          test "$n" -ge 4
+          # reference: a clean full download
+          timeout 60 ../hlsdl/hlsdl -f -o ref.ts rs_full.m3u8
+          # a playlist whose 3rd segment points at a missing file
+          awk 'BEGIN{i=0} /\.ts$/{i++; if(i==3){print "missing.ts"; next}} {print}' rs_full.m3u8 > rs_broken.m3u8
+          # first run stops at the bad segment, leaving out.ts + the sidecar
+          if timeout 60 ../hlsdl/hlsdl -f -R -o out.ts rs_broken.m3u8; then
+            echo "expected the broken run to fail" >&2; exit 1
+          fi
+          test -s out.ts.hlsdl.resume
+          grep -q '^done 2$' out.ts.hlsdl.resume
+          # resume against the good playlist - must finish and match the reference
+          timeout 60 ../hlsdl/hlsdl -R -o out.ts rs_full.m3u8
+          test ! -e out.ts.hlsdl.resume
+          cmp ref.ts out.ts
+          # a sidecar that says "already complete" is a clean no-op
+          cp ref.ts out2.ts
+          printf 'hlsdl-resume 1\ntotal %d\ndone %d\nbytes %d\nmap 0\n' "$n" "$n" "$(stat -c%s ref.ts)" > out2.ts.hlsdl.resume
+          timeout 30 ../hlsdl/hlsdl -R -o out2.ts rs_full.m3u8
+          test ! -e out2.ts.hlsdl.resume
+          cmp ref.ts out2.ts
+      - name: fixture - interrupted fMP4 (EXT-X-MAP) download resumes
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=5:s=64x48 -c:v mpeg4 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename rfi.mp4 \
+                 -hls_segment_filename 'rf%d.m4s' rf_full.m3u8
+          m=$(grep -c '\.m4s$' rf_full.m3u8)
+          test "$m" -ge 4
+          timeout 60 ../hlsdl/hlsdl -f -o rf_ref.mp4 rf_full.m3u8
+          # the EXT-X-MAP line ends in .mp4" so only media segments are rewritten
+          awk 'BEGIN{i=0} /\.m4s$/{i++; if(i==3){print "missing.m4s"; next}} {print}' rf_full.m3u8 > rf_broken.m3u8
+          if timeout 60 ../hlsdl/hlsdl -f -R -o rf_out.mp4 rf_broken.m3u8; then
+            echo "expected the broken fMP4 run to fail" >&2; exit 1
+          fi
+          grep -q '^map 1$' rf_out.mp4.hlsdl.resume
+          grep -q '^done 2$' rf_out.mp4.hlsdl.resume
+          timeout 60 ../hlsdl/hlsdl -R -o rf_out.mp4 rf_full.m3u8
+          test ! -e rf_out.mp4.hlsdl.resume
+          cmp rf_ref.mp4 rf_out.mp4
+          # exactly one ftyp: the init segment was not re-written on resume
+          test "$(grep -a -o ftyp rf_out.mp4 | wc -l)" -eq 1
 
   # ---------------------------------------------------------- e2isubparser
   # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
@@ -226,6 +278,18 @@ jobs:
           make -C lsdir
           ./lsdir/lsdir . >/dev/null
           ./lsdir/lsdir --version | grep -qE '^lsdir v[0-9]'
+      - name: README component-version badges match the sources
+        run: |
+          set -eu
+          check() {
+            grep -qF "img.shields.io/badge/$1-$2-blue" README.md \
+              || { echo "README 'Component versions' badge for $1 is not $2" >&2; exit 1; }
+          }
+          check hlsdl        "$(grep -oE 'hlsdl v[0-9.]+' hlsdl/src/misc.c | head -1 | sed 's/hlsdl //')"
+          check e2isubparser "$(grep -oE '"[0-9]+\.[0-9]+"' e2isubparser/src/subparsermodule.c | head -1 | tr -d '"')"
+          check lsdir        "$(grep -oE '"[0-9.]+"' lsdir/src/lsdir.c | head -1 | tr -d '"')"
+          check cmdwrap      "$(grep -oE 'Version: [0-9]+' cmdwrap/src/cmdwrap.c | grep -oE '[0-9]+')"
+          check f4mdump      "$(grep -oE 'F4MDump v[0-9.]+' f4mdump/src/main.cpp | sed 's/F4MDump //')"
 
   # --------------------------------------------------------------- cppcheck
   # Static analysis of the C we maintain (not the vendored expat / vlc /
