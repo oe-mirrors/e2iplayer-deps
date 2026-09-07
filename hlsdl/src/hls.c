@@ -363,9 +363,10 @@ static void setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
         memcpy(ms->enc_aes.iv_value, me->enc_aes.iv_value, KEYLEN);
         ms->enc_aes.key_url = strdup(me->enc_aes.key_url);
         if (me->enc_aes.iv_is_static == false) {
-            /* For an EXT-X-MAP segment sequence_number is the sequence number
-             * of the first Media Segment that follows it, which is also the
-             * IV mandated by RFC 8216 for that initialization section. */
+            /* RFC 8216 4.3.2.5 requires an explicit IV on the EXT-X-KEY that
+             * applies to an EXT-X-MAP, so for the init segment this
+             * sequence-number value is a best-effort guess for non-conformant
+             * playlists. For a media segment it is the mandated IV. */
             char iv_str[STRLEN_BTS(KEYLEN)];
             uint8_t iv_bin[KEYLEN];
             snprintf(iv_str, STRLEN_BTS(KEYLEN), "%032x\n", ms->sequence_number);
@@ -460,6 +461,22 @@ finish:
 
     if (i > 0) {
         me->last_media_sequence = me->first_media_sequence + i - 1;
+    }
+
+    /* An EXT-X-MAP that appeared before the EXT-X-KEY it belongs to was
+     * parsed while encryption was still off, so setup_segment_aes() gave it
+     * no key and it would be written out undecrypted. Back-fill from the
+     * final key state - correct for the common single-key playlist; the
+     * warning covers anything more exotic. */
+    if (me->encryption) {
+        struct hls_media_segment *s = me->first_media_segment;
+        while (s) {
+            if (s->is_map && s->enc_aes.key_url == NULL) {
+                MSG_WARNING("EXT-X-MAP before EXT-X-KEY - applying the playlist key to the init segment.\n");
+                setup_segment_aes(me, s);
+            }
+            s = s->next;
+        }
     }
 
     media_segment_cleanup(ms);
@@ -1214,6 +1231,15 @@ static int decrypt_aes128(hls_media_segment_t *s, ByteBuffer_t *buf)
     return 0;
 }
 
+/* pthread_cleanup handler: pthread_cond_timedwait reacquires the mutex before
+ * acting on a cancellation, so a plain pthread_cancel() on this thread would
+ * leave media_playlist_mtx locked and the later pthread_mutex_destroy() would
+ * return EBUSY. */
+static void unlock_media_playlist_mtx(void *mtx)
+{
+    pthread_mutex_unlock((pthread_mutex_t *)mtx);
+}
+
 static void *hls_playlist_update_thread(void *arg)
 {
 #ifndef _MSC_VER
@@ -1262,8 +1288,9 @@ static void *hls_playlist_update_thread(void *arg)
         // download live hls can interrupt waiting
         ts.tv_sec =  time(NULL) + refresh_delay_s;
         pthread_mutex_lock(media_playlist_mtx);
+        pthread_cleanup_push(unlock_media_playlist_mtx, media_playlist_mtx);
         pthread_cond_timedwait(media_playlist_refresh_cond, media_playlist_mtx, &ts);
-        pthread_mutex_unlock(media_playlist_mtx);
+        pthread_cleanup_pop(1);   /* unlock; also runs if cancelled in the wait */
 
         // update playlist
         hls_media_playlist_t new_me;
@@ -1362,7 +1389,11 @@ static bool buffer_is_fmp4(const struct ByteBuffer *buf)
     if (!buf || !buf->data || buf->len < 8) {
         return false;
     }
-    const uint8_t *t = (const uint8_t *)buf->data + 4;
+    const uint8_t *d = (const uint8_t *)buf->data;
+    if (d[0] == 0x47) {
+        return false;   /* MPEG-2 TS sync byte - definitely not fMP4 */
+    }
+    const uint8_t *t = d + 4;
     return !memcmp(t, "ftyp", 4) || !memcmp(t, "styp", 4)
         || !memcmp(t, "moof", 4) || !memcmp(t, "moov", 4)
         || !memcmp(t, "sidx", 4) || !memcmp(t, "emsg", 4);
@@ -1487,6 +1518,13 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             me->first_media_segment = ms->next;
             if (me->first_media_segment) {
                 me->first_media_segment->prev = NULL;
+            } else {
+                /* ms was the tail: clear last_media_segment in the same
+                 * critical section, otherwise the refresh thread can write
+                 * through it (me->last_media_segment->next = ...) after
+                 * loop_cleanup has freed this node - a use-after-free that
+                 * also exists upstream. */
+                me->last_media_segment = NULL;
             }
         }
         else {
@@ -1504,17 +1542,18 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             continue;
         }
 
+        int retries = 0;
+        bool wrote_segment = false;
+
         if (ms->is_map) {
             // don't duplicate map (initial) segment if we have already written it
             if (current_map_url && !strcmp(ms->url, current_map_url) && ms->offset == current_map_offset && ms->size == current_map_size)
                 goto loop_cleanup;
-            
+
             MSG_PRINT("Downloading init segment %s\n", ms->url);
         } else
             MSG_PRINT("Downloading part %d\n", ms->sequence_number);
-        
-        int retries = 0;
-        bool wrote_segment = false;
+
         do {
             struct ByteBuffer seg;
             memset(&seg, 0x00, sizeof(seg));
@@ -1578,6 +1617,7 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
             downloaded_duration_ms += ms->duration_ms;
             if (hls_args.live_duration_sec > 0 && downloaded_duration_ms > hls_args.live_duration_sec * 1000) {
+                free(seg.data);
                 download = false;
                 pthread_cancel(thread);
                 break;
@@ -1745,6 +1785,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     struct hls_media_segment *ms_audio = NULL;
     merge_context_t merge_context;
     bool drop_audio = false;
+    bool audio_map_written = false;
 
     if (me_audio) {
         ms_audio = me_audio->first_media_segment;
@@ -1758,6 +1799,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
          * consume a segment from the other playlist for it. */
         if (ms->is_map) {
             if (0 != vod_download_segment(&session, me, ms, &seg)) {
+                ret = 1;
                 break;
             }
             if (0 != detect_media_type(me, &seg)) {
@@ -1772,17 +1814,25 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         }
         if (ms_audio && ms_audio->is_map) {
             if (0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
+                ret = 1;
                 break;
             }
-            /* The video EXT-X-MAP is processed first, so me->media_type is
-             * already known here. A separate audio rendition cannot be muxed
-             * into fMP4 output - drop it (and its init header) right away. */
+            /* A separate audio rendition cannot be muxed into fMP4 output;
+             * drop its init header. me->media_type is normally known here (the
+             * video EXT-X-MAP is the first list entry), but the guard also
+             * copes with an audio init that somehow arrives first. */
             if (!drop_audio && me->media_type == MEDIA_TYPE_FMP4) {
                 MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
                 drop_audio = true;
             }
-            if (!drop_audio) {
+            /* Only the leading audio init segment may be written raw. A
+             * second one mid-stream (re-init after a discontinuity) would
+             * land inside the muxed TS and corrupt it. */
+            if (!drop_audio && !audio_map_written) {
                 download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
+                audio_map_written = true;
+            } else if (!drop_audio) {
+                MSG_WARNING("Mid-stream audio EXT-X-MAP ignored - re-init after a discontinuity is not handled.\n");
             }
             free(seg_audio.data);
             ms_audio = ms_audio->next;
@@ -1790,6 +1840,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         }
 
         if (0 != vod_download_segment(&session, me, ms, &seg)) {
+            ret = 1;
             break;
         }
 
@@ -1826,6 +1877,8 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         uint8_t *first_audio_packet = NULL;
         if (ms_audio) {
             if ( 0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
+                free(seg.data);
+                ret = 1;
                 break;
             }
             first_audio_packet = find_first_ts_packet(&seg_audio);
