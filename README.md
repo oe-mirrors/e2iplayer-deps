@@ -8,23 +8,10 @@ OE/OpenATV feed recipe.
 ## Github status
 
 [![build deps](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/ci.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/ci.yml)
-[![hygiene](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/hygiene.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/hygiene.yml)
-[![Tag on version change](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/tag_release.yml/badge.svg)](https://github.com/oe-mirrors/e2iplayer-deps/actions/workflows/tag_release.yml)
 [![Github last commit](https://img.shields.io/github/last-commit/oe-mirrors/e2iplayer-deps)](https://github.com/oe-mirrors/e2iplayer-deps/commits)
 [![GitHub Activity](https://img.shields.io/github/commit-activity/y/oe-mirrors/e2iplayer-deps.svg?label=commits)](https://github.com/oe-mirrors/e2iplayer-deps/commits)
 [![Issues](https://img.shields.io/github/issues/oe-mirrors/e2iplayer-deps?color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/issues)
 ![Platform](https://img.shields.io/badge/Platform-Enigma2-orange.svg)
-
-**Component versions**
-
-[![hlsdl](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=hlsdl-*&label=hlsdl&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=hlsdl)
-[![e2isubparser](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=e2isubparser-*&label=e2isubparser&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=e2isubparser)
-[![lsdir](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=lsdir-*&label=lsdir&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=lsdir)
-[![cmdwrap](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=cmdwrap-*&label=cmdwrap&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=cmdwrap)
-[![f4mdump](https://img.shields.io/github/v/tag/oe-mirrors/e2iplayer-deps?filter=f4mdump-*&label=f4mdump&color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/tags?q=f4mdump)
-
-The version badges fill in once `tag_release.yml` has run on master (it
-tags `<component>-v<version>` from each component's own version string).
 
 ## SonarCloud status
 
@@ -151,4 +138,4 @@ keeps its own upstream license.
 ### 🤝 Contributing
 
 Pull requests welcome. Fork, branch, commit with a clear message, open a
-PR. CI (`build deps`, `hygiene`) runs on every push and PR.
+PR. CI (`build deps`) runs on every push and PR.
