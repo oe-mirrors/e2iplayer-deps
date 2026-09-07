@@ -29,8 +29,8 @@ static void *read_text_file(const char *pPath)
             } else {
                 buff[size] = '\0';
             }
-            fclose(f);
         }
+        fclose(f);
     }
     return buff;
 }
