@@ -1,102 +1,62 @@
-/* expat_config.h.  Generated from expat_config.h.in by configure.  */
-/* expat_config.h.in.  Generated from configure.ac by autoheader.  */
+/* expat_config.h for the e2iplayer vendored copy of Expat.
 
-/* 1234 = LIL_ENDIAN, 4321 = BIGENDIAN */
-#define BYTEORDER 1234
+   Hand-written (Expat is normally configured by autotools/CMake, which we
+   do not run here). Kept deliberately small: only what lib/xmlparse.c,
+   lib/xmltok.c and lib/xmlrole.c actually look at.
 
-/* Define to 1 if you have the `bcopy' function. */
-#define HAVE_BCOPY 1
+   Vendored Expat version: 2.6.4.  The directory is still called
+   "expat-2.2.0" so that the out-of-tree OE build recipe keeps working
+   without a path change.                                              */
 
-/* Define to 1 if you have the <dlfcn.h> header file. */
+#ifndef EXPAT_CONFIG_H
+#define EXPAT_CONFIG_H 1
+
+/* Byte order, derived from the compiler instead of hard-coding
+   little-endian as the old 2.2.0 config did (big-endian enigma2 boxes
+   still exist). GCC and Clang always define __BYTE_ORDER__.           */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)              \
+    && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#  define BYTEORDER 4321
+#else
+#  define BYTEORDER 1234
+#endif
+
+/* Standard headers / libc features present on every target we build for
+   (Linux/glibc, Linux/musl, macOS). */
 #define HAVE_DLFCN_H 1
-
-/* Define to 1 if you have the <fcntl.h> header file. */
 #define HAVE_FCNTL_H 1
-
-/* Define to 1 if you have the `getpagesize' function. */
-#define HAVE_GETPAGESIZE 1
-
-/* Define to 1 if you have the <inttypes.h> header file. */
 #define HAVE_INTTYPES_H 1
-
-/* Define to 1 if you have the `memmove' function. */
+#define HAVE_STDINT_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STRING_H 1
+#define HAVE_STRINGS_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_UNISTD_H 1
 #define HAVE_MEMMOVE 1
-
-/* Define to 1 if you have the <memory.h> header file. */
-#define HAVE_MEMORY_H 1
-
-/* Define to 1 if you have a working `mmap' system call. */
+#define HAVE_BCOPY 1
+#define HAVE_GETPAGESIZE 1
 #define HAVE_MMAP 1
 
-/* Define to 1 if you have the <stdint.h> header file. */
-#define HAVE_STDINT_H 1
+/* Entropy source for the hash-collision-attack salt. /dev/urandom is
+   present on every enigma2 box (and on the CI runners); Expat falls back
+   to it after trying getrandom(2). On Windows Expat uses rand_s()
+   automatically. */
+#define XML_DEV_URANDOM 1
 
-/* Define to 1 if you have the <stdlib.h> header file. */
-#define HAVE_STDLIB_H 1
-
-/* Define to 1 if you have the <strings.h> header file. */
-#define HAVE_STRINGS_H 1
-
-/* Define to 1 if you have the <string.h> header file. */
-#define HAVE_STRING_H 1
-
-/* Define to 1 if you have the <sys/param.h> header file. */
-#define HAVE_SYS_PARAM_H 1
-
-/* Define to 1 if you have the <sys/stat.h> header file. */
-#define HAVE_SYS_STAT_H 1
-
-/* Define to 1 if you have the <sys/types.h> header file. */
-#define HAVE_SYS_TYPES_H 1
-
-/* Define to 1 if you have the <unistd.h> header file. */
-#define HAVE_UNISTD_H 1
-
-/* Define to the sub-directory where libtool stores uninstalled libraries. */
-#define LT_OBJDIR ".libs/"
-
-/* Define to the address where bug reports for this package should be sent. */
-#define PACKAGE_BUGREPORT "expat-bugs@libexpat.org"
-
-/* Define to the full name of this package. */
-#define PACKAGE_NAME "expat"
-
-/* Define to the full name and version of this package. */
-#define PACKAGE_STRING "expat 2.2.0"
-
-/* Define to the one symbol short name of this package. */
-#define PACKAGE_TARNAME "expat"
-
-/* Define to the home page for this package. */
-#define PACKAGE_URL ""
-
-/* Define to the version of this package. */
-#define PACKAGE_VERSION "2.2.0"
-
-/* Define to 1 if you have the ANSI C header files. */
-#define STDC_HEADERS 1
-
-/* whether byteorder is bigendian */
-/* #undef WORDS_BIGENDIAN */
-
-/* Define to specify how much context to retain around the current parse
-   point. */
+/* Parser feature switches - same choices as the previous 2.2.0 config. */
 #define XML_CONTEXT_BYTES 1024
-
-/* Define to make parameter entity parsing functionality available. */
 #define XML_DTD 1
-
-/* Define to make XML Namespaces functionality available. */
+#define XML_GE 1
 #define XML_NS 0
 
-/* Define to __FUNCTION__ or "" if `__func__' does not conform to ANSI C. */
-/* #undef __func__ */
+/* Package identification. */
+#define PACKAGE_BUGREPORT "expat-bugs@libexpat.org"
+#define PACKAGE_NAME "expat"
+#define PACKAGE_STRING "expat 2.6.4"
+#define PACKAGE_TARNAME "expat"
+#define PACKAGE_VERSION "2.6.4"
+#define PACKAGE_URL ""
+#define VERSION PACKAGE_VERSION
 
-/* Define to empty if `const' does not conform to ANSI C. */
-/* #undef const */
-
-/* Define to `long int' if <sys/types.h> does not define. */
-/* #undef off_t */
-
-/* Define to `unsigned int' if <sys/types.h> does not define. */
-/* #undef size_t */
+#endif /* EXPAT_CONFIG_H */
