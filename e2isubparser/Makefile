@@ -34,8 +34,11 @@ override CFLAGS += -Os -fPIC -fno-strict-aliasing \
                    -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE
 override LDFLAGS += -Wl,--gc-sections
 
+# llroundf() from the TTML/HTML code - the OE recipe links it explicitly too
+LDLIBS ?= -lm
+
 $(MODULE): $(SRC)
-	$(CC) -shared $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $(SRC) $(LDFLAGS) -o $@
+	$(CC) -shared $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $(SRC) $(LDFLAGS) -o $@ $(LDLIBS)
 	-$(STRIP) -s $@
 
 clean:

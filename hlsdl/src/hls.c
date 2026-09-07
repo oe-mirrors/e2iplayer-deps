@@ -287,8 +287,8 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
         } else if (!strncmp(tag, "#EXT-X-ENDLIST", 14)){
             me->is_endlist = true;
             return 0;
-        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY-SEQUENCE:", 29)){
-            sscanf(tag+29, "%d", &(me->discontinuity_sequence));
+        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY-SEQUENCE:", 30)){
+            sscanf(tag+30, "%d", &(me->discontinuity_sequence));
             return 0;
         } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY", 20)){
             ms->discontinuity = true;
@@ -318,8 +318,10 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
             map->is_map = true;
             map->size = -1;
             
-            if (!strncmp(end_pos+1, ",BYTERANGE=", 11)) {
-                parse_byterange(end_pos+1+11, &map->offset, &map->size);
+            if (!strncmp(end_pos+1, ",BYTERANGE=\"", 12)) {
+                /* EXT-X-MAP's BYTERANGE is a quoted-string (RFC 8216 4.4.4.5),
+                 * unlike the unquoted #EXT-X-BYTERANGE value - skip the quote. */
+                parse_byterange(end_pos+1+12, &map->offset, &map->size);
             }
 
             return 0;
@@ -1382,7 +1384,7 @@ static int detect_media_type(hls_media_playlist_t *me, const struct ByteBuffer *
                             || me->encryptiontype == ENC_AES_SAMPLE_CTR)) {
             MSG_ERROR("SAMPLE-AES encrypted fragmented MP4 is not supported by "
                       "hlsdl - use a remuxer (e.g. ffmpeg).\n");
-            MSG_API("{\"error_code\":0, \"error_msg\":\"fmp4-sample-aes\"}\n");
+            MSG_API("{\"error_code\":-1, \"error_msg\":\"fmp4-sample-aes\"}\n");
             return 1;
         }
     }
@@ -1419,26 +1421,44 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
     // skip first segments
     if (me->first_media_segment != me->last_media_segment) {
-        struct hls_media_segment *ms = me->last_media_segment;
-        uint64_t duration_ms = 0;
-        uint64_t duration_offset_ms = hls_args.live_start_offset_sec * 1000;
-        while (ms) {
-            duration_ms += ms->duration_ms;
-            if (duration_ms >= duration_offset_ms) {
-                break;
-            }
-            ms = ms->prev;
+        /* An EXT-X-MAP init segment sits at the head with duration 0 and is
+         * never re-queued by the refresh path - detach it before trimming so
+         * it does not get freed with the skipped media segments. */
+        struct hls_media_segment *map = NULL;
+        if (me->first_media_segment->is_map) {
+            map = me->first_media_segment;
+            me->first_media_segment = map->next;
+            me->first_media_segment->prev = NULL;
         }
 
-        if (ms && ms != me->first_media_segment){
-            // remove segments
-            while (me->first_media_segment != ms) {
-                struct hls_media_segment *tmp_ms = me->first_media_segment;
-                me->first_media_segment = me->first_media_segment->next;
-                media_segment_cleanup(tmp_ms);
+        if (me->first_media_segment != me->last_media_segment) {
+            struct hls_media_segment *ms = me->last_media_segment;
+            uint64_t duration_ms = 0;
+            uint64_t duration_offset_ms = hls_args.live_start_offset_sec * 1000;
+            while (ms) {
+                duration_ms += ms->duration_ms;
+                if (duration_ms >= duration_offset_ms) {
+                    break;
+                }
+                ms = ms->prev;
             }
-            ms->prev = NULL;
-            me->first_media_segment = ms;
+
+            if (ms && ms != me->first_media_segment){
+                // remove segments
+                while (me->first_media_segment != ms) {
+                    struct hls_media_segment *tmp_ms = me->first_media_segment;
+                    me->first_media_segment = me->first_media_segment->next;
+                    media_segment_cleanup(tmp_ms);
+                }
+                ms->prev = NULL;
+                me->first_media_segment = ms;
+            }
+        }
+
+        if (map) {
+            map->next = me->first_media_segment;
+            me->first_media_segment->prev = map;
+            me->first_media_segment = map;
         }
 
         me->total_duration_ms = get_duration_hls_media_playlist(me);
@@ -1494,6 +1514,7 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             MSG_PRINT("Downloading part %d\n", ms->sequence_number);
         
         int retries = 0;
+        bool wrote_segment = false;
         do {
             struct ByteBuffer seg;
             memset(&seg, 0x00, sizeof(seg));
@@ -1532,14 +1553,27 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 }
             }
 
+            if (ms->discontinuity) {
+                MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
+            }
+
+            /* AES-128 encrypts the whole segment, so the container sniff has to
+             * run on the plaintext. SAMPLE-AES leaves the box/PES headers in the
+             * clear - sniff (and reject fMP4) before decrypt_sample_aes touches
+             * the buffer. */
+            if (me->encryption == true && me->encryptiontype == ENC_AES128) {
+                decrypt_aes128(ms, &seg);
+            }
+
             if (0 != detect_media_type(me, &seg)) {
                 free(seg.data);
                 download = false;
                 pthread_cancel(thread);
                 break;
             }
-            if (ms->discontinuity) {
-                MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
+
+            if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
+                decrypt_sample_aes(ms, &seg);
             }
 
             downloaded_duration_ms += ms->duration_ms;
@@ -1549,13 +1583,9 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 break;
             }
 
-            if (me->encryption == true && me->encryptiontype == ENC_AES128) {
-                decrypt_aes128(ms, &seg);
-            } else if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
-                decrypt_sample_aes(ms, &seg);
-            }
             download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
             free(seg.data);
+            wrote_segment = true;
 
             set_fresh_connect_http_session(session, 0);
 
@@ -1568,8 +1598,8 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             break;
         } while(true);
         
-        // remember last written map
-        if (ms->is_map) {
+        // remember last written map (only if it actually made it to the output)
+        if (ms->is_map && wrote_segment) {
             free(current_map_url);
             current_map_url = ms->url;
             ms->url = NULL;
@@ -1743,6 +1773,13 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         if (ms_audio && ms_audio->is_map) {
             if (0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
                 break;
+            }
+            /* The video EXT-X-MAP is processed first, so me->media_type is
+             * already known here. A separate audio rendition cannot be muxed
+             * into fMP4 output - drop it (and its init header) right away. */
+            if (!drop_audio && me->media_type == MEDIA_TYPE_FMP4) {
+                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
+                drop_audio = true;
             }
             if (!drop_audio) {
                 download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
