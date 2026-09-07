@@ -255,11 +255,15 @@ jobs:
           chmod 644 "$v3"
           timeout 60 ../hlsdl/hlsdl -R -a ma.m3u8 -o mav_out.ts mv.m3u8
           test ! -e mav_out.ts.hlsdl.resume
-          # both streams survive the resume splice and the file demuxes cleanly
+          test -s mav_out.ts
+          # both streams are still there after the resume splice
           ffprobe -v error -show_entries stream=codec_type -of csv=p=0 mav_out.ts | sort -u > mav_out.txt
           grep -q video mav_out.txt
           grep -q audio mav_out.txt
-          ffprobe -v error -i mav_out.ts -f null -
+          # the resume appended the tail: the file runs most of the ~4 s
+          # reference, not just the 2 segments finished before the break
+          dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 mav_out.ts | cut -d. -f1)
+          test "${dur:-0}" -ge 3
 
 
   # ---------------------------------------------------------- e2isubparser
