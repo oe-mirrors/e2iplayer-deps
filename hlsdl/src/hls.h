@@ -1,5 +1,5 @@
-#ifndef __HLS_DownLoad__hls__
-#define __HLS_DownLoad__hls__
+#ifndef __hlsdl__hls__
+#define __hlsdl__hls__
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,15 +13,21 @@ extern "C" {
 #define MASTER_PLAYLIST 0
 #define MEDIA_PLAYLIST 1
 
+#define ENC_AES_SAMPLE_CTR 0x03
 #define ENC_AES_SAMPLE 0x02
 #define ENC_AES128 0x01
 #define ENC_NONE 0x00
+
+#define MEDIA_TYPE_UNKNOWN 0
+#define MEDIA_TYPE_TS      1
+#define MEDIA_TYPE_FMP4    2  /* fragmented MP4 / CMAF */
 
 #define KEYLEN 16
 
 #define HLSDL_MIN_REFRESH_DELAY_SEC    0
 #define HLSDL_MAX_REFRESH_DELAY_SEC    5
 #define HLSDL_LIVE_START_OFFSET_SEC  120
+#define HLSDL_LIVE_DURATION         (-1)
 #define HLSDL_MAX_RETRIES             30
 #define HLSDL_OPEN_MAX_RETRIES         3
 
@@ -37,6 +43,8 @@ typedef struct hls_media_segment {
     int64_t offset;
     int64_t size;
     int sequence_number;
+    bool is_map;
+    bool discontinuity;   /* an EXT-X-DISCONTINUITY precedes this segment */
     uint64_t duration_ms;
     struct enc_aes128 enc_aes;
     struct hls_media_segment *next;
@@ -56,6 +64,8 @@ typedef struct hls_media_playlist {
     bool is_endlist;
     bool encryption;
     int encryptiontype;
+    int media_type;                /* MEDIA_TYPE_*, detected from the first segment */
+    int discontinuity_sequence;    /* EXT-X-DISCONTINUITY-SEQUENCE */
     int first_media_sequence;
     int last_media_sequence;
     struct hls_media_segment *first_media_segment;
@@ -94,6 +104,8 @@ int get_playlist_type(char *source);
 int handle_hls_master_playlist(struct hls_master_playlist *ma);
 int handle_hls_media_playlist(hls_media_playlist_t *me);
 int download_live_hls(write_ctx_t *ctx, hls_media_playlist_t *me);
+bool consecutive_sync_byte(uint8_t *buf, size_t len, uint8_t n);
+uint8_t * find_first_ts_packet(ByteBuffer_t *buf);
 int download_hls(write_ctx_t *ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio);
 int print_enc_keys(hls_media_playlist_t *me);
 void print_hls_master_playlist(struct hls_master_playlist *ma);

@@ -7,7 +7,7 @@
 #include <time.h>
 
 #ifndef _MSC_VER
-#if !defined(__APPLE__) && !defined(__MINGW32__)
+#if !defined(__APPLE__) && !defined(__MINGW32__) && !defined(__CYGWIN__)
 #include <sys/prctl.h>
 #endif
 #include <unistd.h>
@@ -98,9 +98,16 @@ static void * init_hls_session(void)
 long get_hls_data_from_url(char *url, char **out, size_t *size, int type, char **new_url)
 {
     void *session = init_hls_session();
-    long http_code = get_data_from_url_with_session(&session, url, out, size, type, new_url, NULL);
+    long http_code = get_data_from_url_with_session(&session, url, out, size, type, new_url, -1, -1);
     clean_http_session(session);
     return http_code;
+}
+
+int is_playlist_FPS(char* source)
+{
+    return strstr(source, "KEYFORMAT=\"com.apple.streamingkeydelivery\"") ||
+           strstr(source, "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed") ||
+           strstr(source, "com.microsoft.playready");
 }
 
 int get_playlist_type(char *source)
@@ -111,12 +118,50 @@ int get_playlist_type(char *source)
     }
 
     if (strstr(source, "#EXT-X-STREAM-INF")) {
-        return 0;
+        return MASTER_PLAYLIST;
     }
 
-    return 1;
+    if (!hls_args.force_ignoredrm && is_playlist_FPS(source)) {
+        MSG_WARNING("HLS stream is DRM protected. Exiting\n");
+        return -1;
+    }
+
+    return MEDIA_PLAYLIST;
 }
 
+/*
+ * In response to
+ * http://stackoverflow.com/questions/1634359/is-there-a-reverse-fn-for-strstr
+ *
+ * Basically, strstr but return last occurence, not first.
+ *
+ * This file contains several implementations and a harness to test and
+ * benchmark them.
+ *
+ * Some of the implementations of the actual function are copied from
+ * elsewhere; they are commented with the location. The rest of the coe
+ * was written by Lars Wirzenius (liw@liw.fi) and is hereby released into
+ * the public domain. No warranty. If it turns out to be broken, you get
+ * to keep the pieces.
+ */
+
+ /* By liw. */
+static char* last_strstr(const char* haystack, const char* needle)
+{
+    if (*needle == '\0')
+        return (char*)haystack;
+
+    char* result = NULL;
+    for (;;) {
+        char* p = strstr(haystack, needle);
+        if (p == NULL)
+            break;
+        result = p;
+        haystack = p + 1;
+    }
+
+    return result;
+}
 static int extend_url(char **url, const char *baseurl)
 {
     static const char proxy_marker[] = "englandproxy.co.uk"; // ugly workaround to be fixed
@@ -156,8 +201,7 @@ static int extend_url(char **url, const char *baseurl)
         free(domain);
         return 0;
     }
-
-    else {
+    else if (strstr(baseurl, "://")) {
         // URLs can have '?'. To make /../ work, remove it.
         char *domain = strdup(baseurl);
         char *find_questionmark = strchr(domain, '?');
@@ -173,6 +217,54 @@ static int extend_url(char **url, const char *baseurl)
         free(domain);
         return 0;
     }
+    else {
+        // Assume local URL
+        char* folder = strdup(baseurl);
+        char* separator = "/";
+        char* find_folder = last_strstr(folder, separator);
+        if (find_folder) {
+            *find_folder = '\0';
+        } else {
+            separator = "\\";
+            find_folder = last_strstr(folder, separator);
+            if (find_folder)
+                *find_folder = '\0';
+        }
+        if (find_folder) {
+            char* buffer = malloc(max_length);
+            snprintf(buffer, max_length, "%s%s%s", folder, separator, *url);
+            *url = realloc(*url, strlen(buffer) + 1);
+            strcpy(*url, buffer);
+            free(buffer);
+        }
+        free(folder);
+        return 0;
+    }
+}
+
+static void segment_list_append(hls_media_segment_t** first, hls_media_segment_t** last, hls_media_segment_t* ms)
+{
+    if (*first == NULL)
+    {
+        *first = ms;
+        *last = ms;
+    }
+    else
+    {
+        (*last)->next = ms;
+        ms->prev = *last;
+        *last = ms;
+    }
+}
+
+static char* parse_byterange(char *tag, int64_t *seg_offset, int64_t *seg_size)
+{
+    *seg_size = strtoll(tag, &tag, 10);
+    tag = strchr(tag, '@');
+    if (tag) {
+        *seg_offset = strtoll(tag+1, &tag, 10);
+    }
+    return tag;
 }
 
 static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, char *tag, int64_t *seg_offset, int64_t *seg_size)
@@ -181,14 +273,25 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
 
     if (!strncmp(tag, "#EXT-X-KEY:METHOD=AES-128", 25)) {
         enc_type = ENC_AES128;
+        me->enc_aes.iv_is_static = false;
+    } else if (!strncmp(tag, "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR", 32)) {
+        enc_type = ENC_AES_SAMPLE_CTR;
+        me->enc_aes.iv_is_static = is_playlist_FPS(me->source);
     } else if (!strncmp(tag, "#EXT-X-KEY:METHOD=SAMPLE-AES", 28)) {
         enc_type = ENC_AES_SAMPLE;
+        me->enc_aes.iv_is_static = is_playlist_FPS(me->source);
     } else  {
         if (!strncmp(tag, "#EXTINF:", 8)){
             ms->duration_ms = get_duration_ms(tag+8);
             return 0;
         } else if (!strncmp(tag, "#EXT-X-ENDLIST", 14)){
             me->is_endlist = true;
+            return 0;
+        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY-SEQUENCE:", 30)){
+            sscanf(tag+30, "%d", &(me->discontinuity_sequence));
+            return 0;
+        } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY", 20)){
+            ms->discontinuity = true;
             return 0;
         } else if (!strncmp(tag, "#EXT-X-MEDIA-SEQUENCE:", 22)){
             if(sscanf(tag+22, "%d",  &(me->first_media_sequence)) == 1){
@@ -198,11 +301,29 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
             me->target_duration_ms = get_duration_ms(tag+22);
             return 0;
         } else if (!strncmp(tag, "#EXT-X-BYTERANGE:", 17)) {
-            *seg_size = strtoll(tag+17, NULL, 10);
-            tag = strchr(tag+17, '@');
-            if (tag) {
-                *seg_offset = strtoll(tag+1, NULL, 10);
+            parse_byterange(tag+17, seg_offset, seg_size);
+            return 0;
+        } else if (!strncmp(tag, "#EXT-X-MAP:URI=\"", 16)) {
+            tag += 16;
+            char* end_pos = strchr(tag, '"');
+            if (!end_pos) {
+                return 0;
             }
+            
+            hls_media_segment_t* map = malloc(sizeof(struct hls_media_segment));
+            memset(map, 0x00, sizeof(struct hls_media_segment));
+            segment_list_append(&me->first_media_segment, &me->last_media_segment, map);
+                
+            map->url = strndup(tag, end_pos - tag);
+            map->is_map = true;
+            map->size = -1;
+            
+            if (!strncmp(end_pos+1, ",BYTERANGE=\"", 12)) {
+                /* EXT-X-MAP's BYTERANGE is a quoted-string (RFC 8216 4.4.4.5),
+                 * unlike the unquoted #EXT-X-BYTERANGE value - skip the quote. */
+                parse_byterange(end_pos+1+12, &map->offset, &map->size);
+            }
+
             return 0;
         }
         return 1;
@@ -210,7 +331,6 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
 
     me->encryption = true;
     me->encryptiontype = enc_type;
-    me->enc_aes.iv_is_static = false;
 
     char *link_to_key = malloc(strlen(tag) + strlen(me->url) + 10);
     char iv_str[STRLEN_BTS(KEYLEN)] = "\0";
@@ -236,10 +356,29 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
     return 0;
 }
 
+static void setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms)
+{
+    if (me->encryptiontype == ENC_AES128 || me->encryptiontype == ENC_AES_SAMPLE) {
+        memcpy(ms->enc_aes.key_value, me->enc_aes.key_value, KEYLEN);
+        memcpy(ms->enc_aes.iv_value, me->enc_aes.iv_value, KEYLEN);
+        ms->enc_aes.key_url = strdup(me->enc_aes.key_url);
+        if (me->enc_aes.iv_is_static == false) {
+            /* For an EXT-X-MAP segment sequence_number is the sequence number
+             * of the first Media Segment that follows it, which is also the
+             * IV mandated by RFC 8216 for that initialization section. */
+            char iv_str[STRLEN_BTS(KEYLEN)];
+            uint8_t iv_bin[KEYLEN];
+            snprintf(iv_str, STRLEN_BTS(KEYLEN), "%032x\n", ms->sequence_number);
+            str_to_bin(iv_bin, iv_str, KEYLEN);
+            memcpy(ms->enc_aes.iv_value, iv_bin, KEYLEN);
+        }
+    }
+}
+
 static int media_playlist_get_links(hls_media_playlist_t *me)
 {
+    struct hls_media_segment *map = NULL;
     struct hls_media_segment *ms = NULL;
-    struct hls_media_segment *curr_ms = NULL;
     char *src = me->source;
     int64_t seg_offset = 0;
     int64_t seg_size = -1;
@@ -264,32 +403,36 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
             }
             if (*src == '#') {
                 parse_tag(me, ms, src, &seg_offset, &seg_size);
-                continue;
+                
+                if (me->last_media_segment && me->last_media_segment->is_map
+                        && me->last_media_segment != map) { // a new EXT-X-MAP was just parsed
+                    map = me->last_media_segment;
+
+                    map->sequence_number = i + me->first_media_sequence;
+                    setup_segment_aes(me, map);
+
+                    /* Get full url */
+                    extend_url(&(map->url), me->url);
+                }
+                
+                continue;                    
             }
             if (*src == '\0') {
                 goto finish;
             }
 
             char *end_ptr = strchr(src, '\n');
+            char *end_ptr2 = strchr(src, '\r');
+            if (end_ptr2 && end_ptr2 < end_ptr)
+                end_ptr = end_ptr2;
             if (end_ptr != NULL) {
                 int url_size = (int)(end_ptr - src) + 1;
                 ms->url = malloc(url_size);
                 strncpy(ms->url, src, url_size-1);
                 ms->url[url_size-1] = '\0';
+                
                 ms->sequence_number = i + me->first_media_sequence;
-                if (me->encryptiontype == ENC_AES128 || me->encryptiontype == ENC_AES_SAMPLE) {
-                    memcpy(ms->enc_aes.key_value, me->enc_aes.key_value, KEYLEN);
-                    memcpy(ms->enc_aes.iv_value, me->enc_aes.iv_value, KEYLEN);
-                    ms->enc_aes.key_url = strdup(me->enc_aes.key_url);
-                    if (me->enc_aes.iv_is_static == false) {
-                        char iv_str[STRLEN_BTS(KEYLEN)];
-                        snprintf(iv_str, STRLEN_BTS(KEYLEN), "%032x\n", ms->sequence_number);
-                        uint8_t *iv_bin = malloc(KEYLEN);
-                        str_to_bin(iv_bin, iv_str, KEYLEN);
-                        memcpy(ms->enc_aes.iv_value, iv_bin, KEYLEN);
-                        free(iv_bin);
-                    }
-                }
+                setup_segment_aes(me, ms);
 
                 /* Get full url */
                 extend_url(&(ms->url), me->url);
@@ -305,17 +448,7 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
                 }
 
                 /* Add new segment to segment list */
-                if (me->first_media_segment == NULL)
-                {
-                    me->first_media_segment = ms;
-                    curr_ms = ms;
-                }
-                else
-                {
-                    curr_ms->next = ms;
-                    ms->prev = curr_ms;
-                    curr_ms = ms;
-                }
+                segment_list_append(&(me->first_media_segment), &(me->last_media_segment), ms);
                 ms = NULL;
                 i += 1;
                 break;
@@ -324,7 +457,6 @@ static int media_playlist_get_links(hls_media_playlist_t *me)
     }
 
 finish:
-    me->last_media_segment = curr_ms;
 
     if (i > 0) {
         me->last_media_sequence = me->first_media_sequence + i - 1;
@@ -562,6 +694,7 @@ static int sample_aes_append_av_data(ByteBuffer_t *out, ByteBuffer_t *in, const 
     if (pcr[0] & 0x10) {
         adapt_header_size = 8;
         adapt_header[1] = pcr[0] & 0xF0; // set previus flags: discontinuity_indicator, random_access_indicator, elementary_stream_priority_indicator, PCR_flag
+        memcpy(adapt_header + 2, pcr + 1, 6);
     } else if (pcr[0] & 0x20) {
         adapt_header_size = 2;
         adapt_header[1] = pcr[0] & 0xF0; // restore flags as described above
@@ -681,6 +814,30 @@ static uint8_t * remove_emulation_prev(const uint8_t  *src,
     return dst;
 }
 
+static int insert_emulation_prev(   const uint8_t   *src,
+                                    const uint8_t   *src_end,
+                                          uint8_t   *dst,
+                                          uint8_t   *dst_end)
+{
+    int bytes_inserted = 0;
+    while (src + 2 < src_end && dst + 3 < dst_end)
+        if (!*src && !*(src + 1) && *(src + 2) < 3) {
+            *dst++ = *src++;
+            *dst++ = *src++;
+            *dst++ = 3; // insert emulation_prevention_three_byte
+            *dst++ = *src++;
+            bytes_inserted++;
+        }
+        else {
+            *dst++ = *src++;
+        }
+
+    while (src < src_end)
+        *dst++ = *src++;
+
+    return bytes_inserted;
+}
+
 static uint8_t *ff_avc_find_startcode_internal(uint8_t *p, uint8_t *end)
 {
     uint8_t *a = p + 4 - ((intptr_t)p & 3);
@@ -727,7 +884,8 @@ static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in,
     uint8_t *end = buf_in + size;
     uint8_t *nal_start;
     uint8_t *nal_end;
-
+    uint8_t* nal_new_start = NULL;
+    int      nal_new_allocated = 0;
     end = remove_emulation_prev(buf_in, end, buf_in, end);
 
     nal_start = ff_avc_find_startcode(buf_in, end);
@@ -737,8 +895,11 @@ static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in,
             break;
 
         nal_end = ff_avc_find_startcode(nal_start, end);
+        int nal_unit_type = *nal_start & 0x1F;
+        int nal_size = nal_end - nal_start;
         // NAL unit with length of 48 bytes or fewer is completely unencrypted.
-        if (nal_end - nal_start > 48) {
+        if ((nal_unit_type == 1 || nal_unit_type == 5) && nal_size > 48) {
+            uint8_t* nal_start_bkup = nal_start;
             nal_start += 32;
             void *ctx = AES128_CBC_CTX_new();
             AES128_CBC_DecryptInit(ctx, s->enc_aes.key_value, s->enc_aes.iv_value, false);
@@ -747,9 +908,25 @@ static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in,
                 nal_start += 16 * 10; // Each 16-byte block of encrypted data is followed by up to nine 16-byte blocks of unencrypted data.
             }
             AES128_CBC_free(ctx);
+            nal_start = nal_start_bkup;
         }
-        nal_start = nal_end;
+        int bytes_inserted = 0;
+        if (nal_size) {
+            int nal_new_maxsize = nal_size * 4 / 3;
+            nal_new_start = realloc(nal_new_start, nal_new_maxsize);
+            nal_new_allocated = MAX(nal_new_allocated, nal_new_maxsize);
+            bytes_inserted = insert_emulation_prev(nal_start, nal_end, nal_new_start, nal_new_start + nal_new_maxsize);
+        }
+        if (bytes_inserted) {
+            memmove(nal_end + bytes_inserted, nal_end, end - nal_end);
+            memcpy(nal_start, nal_new_start, nal_size + bytes_inserted);
+            nal_start = nal_end + bytes_inserted;
+            end += bytes_inserted;
+        }
+        else
+            nal_start = nal_end;
     }
+    free(nal_new_start);
     return (int)(end - buf_in);
 }
 
@@ -811,7 +988,6 @@ static int sample_aes_decrypt_audio_data(hls_media_segment_t *s, uint8_t *ptr, u
 static int sample_aes_handle_pes_data(hls_media_segment_t *s, ByteBuffer_t *out, ByteBuffer_t *in, uint8_t *pcr, uint16_t pid, audiotype_t audio_codec, uint8_t *counter)
 {
     uint16_t pes_header_size = 0;
-
     // we need to skip PES header it is not part of NAL unit
     if (in->pos <= PES_HEADER_SIZE || in->data[0] != 0x00 || in->data[1] != 0x00 || in->data[1] == 0x01) {
         MSG_ERROR("Wrong or missing PES header!\n");
@@ -830,7 +1006,7 @@ static int sample_aes_handle_pes_data(hls_media_segment_t *s, ByteBuffer_t *out,
 
         // to check if I did not any mistake in offset calculation
         if (size > in->pos) {
-            MSG_ERROR("NAL size after decryption is grater then before - before: %d, after: %d - should never happen!\n", size);
+            MSG_ERROR("NAL size after decryption is grater then before - before: %d, after: %d - should never happen!\n", size, in->pos);
             exit(-1);
         }
 
@@ -905,7 +1081,7 @@ static int decrypt_sample_aes(hls_media_segment_t *s, ByteBuffer_t *buf)
                 uint8_t audio_pcr[7]; // first byte is adaptation filed flags
                 uint8_t video_pcr[7]; // - || -
                 ByteBuffer_t outBuffer = {NULL};
-                outBuffer.data = malloc(buf->len);
+                outBuffer.data = malloc(buf->len * 4 / 3);
                 outBuffer.len = buf->len;
 
                 ByteBuffer_t audioBuffer = {NULL};
@@ -917,7 +1093,7 @@ static int decrypt_sample_aes(hls_media_segment_t *s, ByteBuffer_t *buf)
                 }
 
                 if (video_PID != PID_UNSPEC) {
-                    videoBuffer.data = malloc(buf->len);
+                    videoBuffer.data = malloc(buf->len * 4 / 3);    // reserve space for emulation_prevention_three_byte
                     videoBuffer.len = buf->len;
                 }
 
@@ -953,7 +1129,7 @@ static int decrypt_sample_aes(hls_media_segment_t *s, ByteBuffer_t *buf)
                             }
 
                             if ((packed.afc & 2) && (ptr[5] & 0x10)) { // remember PCR if available
-                                memcpy(pcr, ptr + 4 + 1, 6);
+                                memcpy(pcr, ptr + 4 + 1, 7);
                             } else if ((packed.afc & 2) && (ptr[5] & 0x20)) { // remember discontinuity_indicator if set
                                 pcr[0] = ptr[5];
                             } else {
@@ -1044,7 +1220,7 @@ static void *hls_playlist_update_thread(void *arg)
     char threadname[50];
     strncpy(threadname, __func__, sizeof(threadname));
     threadname[49] = '\0';
-#if !defined(__APPLE__) && !defined(__MINGW32__)
+#if !defined(__APPLE__) && !defined(__MINGW32__) && !defined(__CYGWIN__)
     prctl(PR_SET_NAME, (unsigned long)&threadname);
 #endif
 #endif
@@ -1095,7 +1271,7 @@ static void *hls_playlist_update_thread(void *arg)
 
         size_t size = 0;
         MSG_PRINT("> START DOWNLOAD LIST url[%s]\n", me->url);
-        long http_code = get_data_from_url_with_session(&session, me->url, &new_me.source, &size, STRING, &(new_me.url), NULL);
+        long http_code = get_data_from_url_with_session(&session, me->url, &new_me.source, &size, STRING, &(new_me.url), -1, -1);
         MSG_PRINT("> END DOWNLOAD LIST\n");
         if (200 == http_code && 0 == media_playlist_get_links(&new_me)) {
             // no mutex is needed here because download_live_hls not change this fields
@@ -1115,7 +1291,14 @@ static void *hls_playlist_update_thread(void *arg)
                     // add new segments
                     struct hls_media_segment *ms = new_me.first_media_segment;
                     while (ms) {
-                        if (ms->sequence_number > me->last_media_sequence) {
+                        /* Only splice in genuinely new media segments. The
+                         * initialization segment (EXT-X-MAP) was already queued
+                         * by the first media_playlist_get_links() call and
+                         * written before the first part; re-queuing the whole
+                         * window on every refresh would re-download it all. A
+                         * mid-stream change of the init segment (discontinuity)
+                         * is not handled. */
+                        if (!ms->is_map && ms->sequence_number > me->last_media_sequence) {
                             if (ms->prev) {
                                 ms->prev->next = NULL;
                             }
@@ -1172,6 +1355,42 @@ static void *hls_playlist_update_thread(void *arg)
     return NULL;
 }
 
+/* An fMP4 / CMAF segment starts with an ISO-BMFF box: <4-byte size><4-byte
+ * type>. A TS segment starts with the 0x47 sync byte. */
+static bool buffer_is_fmp4(const struct ByteBuffer *buf)
+{
+    if (!buf || !buf->data || buf->len < 8) {
+        return false;
+    }
+    const uint8_t *t = (const uint8_t *)buf->data + 4;
+    return !memcmp(t, "ftyp", 4) || !memcmp(t, "styp", 4)
+        || !memcmp(t, "moof", 4) || !memcmp(t, "moov", 4)
+        || !memcmp(t, "sidx", 4) || !memcmp(t, "emsg", 4);
+}
+
+/* Called once, after the first EXT-X-MAP or media segment has been fetched.
+ * Sets me->media_type and rejects the combinations hlsdl cannot produce a
+ * usable file for. Returns non-zero to abort the download. */
+static int detect_media_type(hls_media_playlist_t *me, const struct ByteBuffer *first)
+{
+    if (me->media_type != MEDIA_TYPE_UNKNOWN) {
+        return 0;
+    }
+    me->media_type = buffer_is_fmp4(first) ? MEDIA_TYPE_FMP4 : MEDIA_TYPE_TS;
+
+    if (me->media_type == MEDIA_TYPE_FMP4) {
+        MSG_VERBOSE("Fragmented MP4 stream.\n");
+        if (me->encryption && (me->encryptiontype == ENC_AES_SAMPLE
+                            || me->encryptiontype == ENC_AES_SAMPLE_CTR)) {
+            MSG_ERROR("SAMPLE-AES encrypted fragmented MP4 is not supported by "
+                      "hlsdl - use a remuxer (e.g. ffmpeg).\n");
+            MSG_API("{\"error_code\":-1, \"error_msg\":\"fmp4-sample-aes\"}\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
@@ -1202,26 +1421,44 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
     // skip first segments
     if (me->first_media_segment != me->last_media_segment) {
-        struct hls_media_segment *ms = me->last_media_segment;
-        uint64_t duration_ms = 0;
-        uint64_t duration_offset_ms = hls_args.live_start_offset_sec * 1000;
-        while (ms) {
-            duration_ms += ms->duration_ms;
-            if (duration_ms >= duration_offset_ms) {
-                break;
-            }
-            ms = ms->prev;
+        /* An EXT-X-MAP init segment sits at the head with duration 0 and is
+         * never re-queued by the refresh path - detach it before trimming so
+         * it does not get freed with the skipped media segments. */
+        struct hls_media_segment *map = NULL;
+        if (me->first_media_segment->is_map) {
+            map = me->first_media_segment;
+            me->first_media_segment = map->next;
+            me->first_media_segment->prev = NULL;
         }
 
-        if (ms && ms != me->first_media_segment){
-            // remove segments
-            while (me->first_media_segment != ms) {
-                struct hls_media_segment *tmp_ms = me->first_media_segment;
-                me->first_media_segment = me->first_media_segment->next;
-                media_segment_cleanup(tmp_ms);
+        if (me->first_media_segment != me->last_media_segment) {
+            struct hls_media_segment *ms = me->last_media_segment;
+            uint64_t duration_ms = 0;
+            uint64_t duration_offset_ms = hls_args.live_start_offset_sec * 1000;
+            while (ms) {
+                duration_ms += ms->duration_ms;
+                if (duration_ms >= duration_offset_ms) {
+                    break;
+                }
+                ms = ms->prev;
             }
-            ms->prev = NULL;
-            me->first_media_segment = ms;
+
+            if (ms && ms != me->first_media_segment){
+                // remove segments
+                while (me->first_media_segment != ms) {
+                    struct hls_media_segment *tmp_ms = me->first_media_segment;
+                    me->first_media_segment = me->first_media_segment->next;
+                    media_segment_cleanup(tmp_ms);
+                }
+                ms->prev = NULL;
+                me->first_media_segment = ms;
+            }
+        }
+
+        if (map) {
+            map->next = me->first_media_segment;
+            me->first_media_segment->prev = map;
+            me->first_media_segment = map;
         }
 
         me->total_duration_ms = get_duration_hls_media_playlist(me);
@@ -1235,13 +1472,15 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
     void *session = init_hls_session();
     set_timeout_session(session, 2L, 3L);
+    char* current_map_url = NULL;
+    int64_t current_map_offset = 0;
+    int64_t current_map_size = -1;
     uint64_t downloaded_duration_ms = 0;
     int64_t download_size = 0;
     time_t repTime = 0;
     bool download = true;
-    char range_buff[22];
-    while(download) {
 
+    while(download) {
         pthread_mutex_lock(&media_playlist_mtx);
         struct hls_media_segment *ms = me->first_media_segment;
         if (ms != NULL) {
@@ -1265,20 +1504,24 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             continue;
         }
 
-        MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        if (ms->is_map) {
+            // don't duplicate map (initial) segment if we have already written it
+            if (current_map_url && !strcmp(ms->url, current_map_url) && ms->offset == current_map_offset && ms->size == current_map_size)
+                goto loop_cleanup;
+            
+            MSG_PRINT("Downloading init segment %s\n", ms->url);
+        } else
+            MSG_PRINT("Downloading part %d\n", ms->sequence_number);
+        
         int retries = 0;
-        char *range = NULL;
-        if (ms->size > -1) {
-            snprintf(range_buff, sizeof(range_buff), "%"PRId64"-%"PRId64, ms->offset, ms->offset + ms->size - 1);
-            range = range_buff;
-        }
+        bool wrote_segment = false;
         do {
             struct ByteBuffer seg;
             memset(&seg, 0x00, sizeof(seg));
             size_t size = 0;
-            long http_code = get_data_from_url_with_session(&session, ms->url, (char **)&(seg.data), &size, BINARY, NULL, range);
+            long http_code = get_data_from_url_with_session(&session, ms->url, (char **)&(seg.data), &size, BINARY, NULL, ms->offset, ms->size);
             seg.len = (int)size;
-            if (!(http_code == 200 || (http_code == 206 && (range != NULL || hls_args.accept_partial_content)))) {
+            if (!(http_code == 200 || (http_code == 206 && (ms->size > -1 || hls_args.accept_partial_content)))) {
                 int first_media_sequence = 0;
                 if (seg.data) {
                     free(seg.data);
@@ -1289,7 +1532,9 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 first_media_sequence = me->first_media_sequence;
                 pthread_mutex_unlock(&media_playlist_mtx);
 
-                if(http_code != 403 && http_code != 401 &&  http_code != 410 && retries <= hls_args.segment_download_retries && ms->sequence_number > first_media_sequence) {
+                if (http_code != 403 && http_code != 401 && http_code != 410
+                        && retries <= hls_args.segment_download_retries
+                        && (ms->sequence_number > first_media_sequence || ms->is_map)) {
                     clean_http_session(session);
                     sleep(1);
                     session = init_hls_session();
@@ -1308,15 +1553,39 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 }
             }
 
-            downloaded_duration_ms += ms->duration_ms;
+            if (ms->discontinuity) {
+                MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
+            }
 
+            /* AES-128 encrypts the whole segment, so the container sniff has to
+             * run on the plaintext. SAMPLE-AES leaves the box/PES headers in the
+             * clear - sniff (and reject fMP4) before decrypt_sample_aes touches
+             * the buffer. */
             if (me->encryption == true && me->encryptiontype == ENC_AES128) {
                 decrypt_aes128(ms, &seg);
-            } else if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
+            }
+
+            if (0 != detect_media_type(me, &seg)) {
+                free(seg.data);
+                download = false;
+                pthread_cancel(thread);
+                break;
+            }
+
+            if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
                 decrypt_sample_aes(ms, &seg);
             }
+
+            downloaded_duration_ms += ms->duration_ms;
+            if (hls_args.live_duration_sec > 0 && downloaded_duration_ms > hls_args.live_duration_sec * 1000) {
+                download = false;
+                pthread_cancel(thread);
+                break;
+            }
+
             download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
             free(seg.data);
+            wrote_segment = true;
 
             set_fresh_connect_http_session(session, 0);
 
@@ -1328,9 +1597,21 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 
             break;
         } while(true);
+        
+        // remember last written map (only if it actually made it to the output)
+        if (ms->is_map && wrote_segment) {
+            free(current_map_url);
+            current_map_url = ms->url;
+            ms->url = NULL;
+            current_map_offset = ms->offset;
+            current_map_size = ms->size;
+        }
 
+loop_cleanup:
         media_segment_cleanup(ms);
     }
+    
+    free(current_map_url);
 
     pthread_join(thread, &ret);
     pthread_mutex_destroy(&media_playlist_mtx);
@@ -1354,20 +1635,18 @@ static int vod_download_segment(void **psession, hls_media_playlist_t *me, struc
 {
     int retries = 0;
     int ret = 0;
-    char range_buff[22];
     while (true) {
-        MSG_PRINT("Downloading part %d\n", ms->sequence_number);
-        char *range = NULL;
-        if (ms->size > -1) {
-            snprintf(range_buff, sizeof(range_buff), "%"PRId64"-%"PRId64, ms->offset, ms->offset + ms->size - 1);
-            range = range_buff;
+        if (ms->is_map) {
+            MSG_PRINT("Downloading init segment %s\n", ms->url);
+        } else {
+            MSG_PRINT("Downloading part %d\n", ms->sequence_number);
         }
 
         memset(seg, 0x00, sizeof(*seg));
         size_t size = 0;
-        long http_code = get_data_from_url_with_session(psession, ms->url, (char **)&(seg->data), &size, BINARY, NULL, range);
+        long http_code = get_data_from_url_with_session(psession, ms->url, (char **)&(seg->data), &size, BINARY, NULL, ms->offset, ms->size);
         seg->len = (int)size;
-        if (!(http_code == 200 || (http_code == 206 && (range != NULL || hls_args.accept_partial_content)))) {
+        if (!(http_code == 200 || (http_code == 206 && (ms->size > -1 || hls_args.accept_partial_content)))) {
             if (seg->data) {
                 free(seg->data);
                 seg->data = NULL;
@@ -1410,6 +1689,41 @@ static int vod_download_segment(void **psession, hls_media_playlist_t *me, struc
     return ret;
 }
 
+bool consecutive_sync_byte(uint8_t *buf, size_t len, uint8_t n) {
+    if (len < n * TS_PACKET_LENGTH) {
+        return false;
+    }
+
+    for (uint8_t i = 1; i < n; ++i) {
+        if (buf[i * TS_PACKET_LENGTH] != TS_SYNC_BYTE) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+uint8_t * find_first_ts_packet(ByteBuffer_t *buf) {
+    uint8_t *cursor = buf->data;
+    size_t len = buf->len;
+
+    while (TS_PACKET_LENGTH <= len) {
+        uint8_t *next = memchr(cursor, TS_SYNC_BYTE, len);
+        if (next == NULL) {
+            return NULL;
+        }
+        len -= (next - cursor);
+        cursor = next;
+        if (consecutive_sync_byte(cursor, len, 3)) {
+            return cursor;
+        }
+        ++cursor;
+        --len;
+    }
+
+    return NULL;
+}
+
 int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio)
 {
     MSG_VERBOSE("Downloading segments.\n");
@@ -1430,6 +1744,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     struct hls_media_segment *ms = me->first_media_segment;
     struct hls_media_segment *ms_audio = NULL;
     merge_context_t merge_context;
+    bool drop_audio = false;
 
     if (me_audio) {
         ms_audio = me_audio->first_media_segment;
@@ -1438,22 +1753,103 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     }
 
     while(ms) {
+        /* Initialization segment (EXT-X-MAP): write it verbatim, never run it
+         * through the TS packet scanner or the audio/video merge, and do not
+         * consume a segment from the other playlist for it. */
+        if (ms->is_map) {
+            if (0 != vod_download_segment(&session, me, ms, &seg)) {
+                break;
+            }
+            if (0 != detect_media_type(me, &seg)) {
+                free(seg.data);
+                ret = 1;
+                break;
+            }
+            download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+            free(seg.data);
+            ms = ms->next;
+            continue;
+        }
+        if (ms_audio && ms_audio->is_map) {
+            if (0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
+                break;
+            }
+            /* The video EXT-X-MAP is processed first, so me->media_type is
+             * already known here. A separate audio rendition cannot be muxed
+             * into fMP4 output - drop it (and its init header) right away. */
+            if (!drop_audio && me->media_type == MEDIA_TYPE_FMP4) {
+                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
+                drop_audio = true;
+            }
+            if (!drop_audio) {
+                download_size += out_ctx->write(seg_audio.data, seg_audio.len, out_ctx->opaque);
+            }
+            free(seg_audio.data);
+            ms_audio = ms_audio->next;
+            continue;
+        }
+
         if (0 != vod_download_segment(&session, me, ms, &seg)) {
             break;
         }
 
-        // first segment should be TS for success merge
-        if (ms_audio && seg.len > TS_PACKET_LENGTH && seg.data[0] == TS_SYNC_BYTE) {
+        if (0 != detect_media_type(me, &seg)) {
+            free(seg.data);
+            ret = 1;
+            break;
+        }
+
+        if (ms->discontinuity) {
+            MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
+        }
+
+        /* Fragmented MP4: concatenate init + media fragments verbatim. A
+         * separate audio rendition cannot be muxed here. */
+        if (me->media_type == MEDIA_TYPE_FMP4) {
+            if (ms_audio && !drop_audio) {
+                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
+                drop_audio = true;
+            }
+            download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+            free(seg.data);
+            downloaded_duration_ms += ms->duration_ms;
+            time_t curRepTime = time(NULL);
+            if ((curRepTime - repTime) >= 1) {
+                MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(downloaded_duration_ms / 1000), download_size);
+                repTime = curRepTime;
+            }
+            ms = ms->next;
+            continue;
+        }
+
+        uint8_t *first_video_packet = find_first_ts_packet(&seg);
+        uint8_t *first_audio_packet = NULL;
+        if (ms_audio) {
             if ( 0 != vod_download_segment(&session, me_audio, ms_audio, &seg_audio)) {
                 break;
             }
+            first_audio_packet = find_first_ts_packet(&seg_audio);
+        }
 
-            download_size += merge_packets(&merge_context, seg.data, seg.len, seg_audio.data, seg_audio.len);
+        // first segment should be TS for success merge
+        if (first_video_packet && first_audio_packet) {
+            size_t video_len = seg.len - (first_video_packet - seg.data);
+            size_t audio_len = seg_audio.len - (first_audio_packet - seg_audio.data);
 
-            free(seg_audio.data);
-            ms_audio = ms_audio->next;
+            download_size += merge_packets(
+                &merge_context,
+                first_video_packet,
+                video_len,
+                first_audio_packet,
+                audio_len
+            );
         } else {
             download_size += out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+        }
+
+        if (ms_audio) {
+            free(seg_audio.data);
+            ms_audio = ms_audio->next;
         }
 
         free(seg.data);
@@ -1582,7 +1978,13 @@ int fill_key_value(struct enc_aes128 *es)
         {
             memcpy(es->key_value, cache_key_value, KEYLEN);
         }
-        else
+        else if (hls_args.key_value)
+        {
+            memcpy(es->key_value, hls_args.key_value, KEYLEN);
+            memcpy(cache_key_value, es->key_value, KEYLEN);
+            free(cache_key_url);
+            cache_key_url = strdup(es->key_url);
+        } else
         {
             char *key_url = NULL;
             char *key_value = NULL;
@@ -1602,8 +2004,13 @@ int fill_key_value(struct enc_aes128 *es)
                 free(key_url);
             }
 
-            if (http_code != 200 || size == 0) {
+            if (http_code != 200) {
                 MSG_ERROR("Getting key-file [%s] failed http_code[%d].\n", es->key_url, http_code);
+                return 1;
+            }
+
+            if (size != KEYLEN) {
+                MSG_ERROR("Wrong length key-file. Expected %u bytes but got %u.\n", KEYLEN, size);
                 return 1;
             }
 

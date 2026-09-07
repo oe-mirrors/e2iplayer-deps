@@ -1,0 +1,53 @@
+name: SonarCloud
+
+# Dormant until a SONAR_TOKEN secret is added to the repo (Settings ->
+# Secrets and variables -> Actions). Set up the project once at
+# https://sonarcloud.io (org "oe-mirrors", key "oe-mirrors_e2iplayer-deps"),
+# generate a token, add it as SONAR_TOKEN, and this starts scanning C on
+# every push / PR. sonar-project.properties holds the rest of the config.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sonarcloud:
+    name: Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Token present?
+        id: gate
+        run: echo "run=${{ secrets.SONAR_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps
+        if: steps.gate.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev python3-dev
+
+      - name: Install SonarCloud build wrapper
+        if: steps.gate.outputs.run == 'true'
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v5
+
+      - name: Build under the wrapper
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          build-wrapper-linux-x86-64 --out-dir bw-output sh -c '
+            make -C hlsdl &&
+            make -C cmdwrap &&
+            make -C lsdir &&
+            make -C e2isubparser CFLAGS="-w"
+          '
+
+      - name: SonarCloud scan
+        if: steps.gate.outputs.run == 'true'
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io

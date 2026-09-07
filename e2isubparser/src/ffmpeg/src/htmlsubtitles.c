@@ -26,6 +26,11 @@
 #define FF_ARRAY_ELEMS(a) (sizeof(a) / sizeof((a)[0]))
 #define FFMIN(a,b) ((a) > (b) ? (b) : (a))
 
+/* Bounded append into dst. Upstream FFmpeg grows dst dynamically (AVBPrint);
+ * here dst is a fixed caller buffer, so drop anything past dst_size-1 rather
+ * than overflowing it. */
+#define PUT_CH(c) do { if (dstIdx + 1 < dst_size) dst[dstIdx++] = (c); } while (0)
+
 static size_t av_strlcpy(char *dst, const char *src, size_t size)
 {
     size_t len = 0;
@@ -71,7 +76,7 @@ static void rstrip_spaces_buf(char *buf)
     }
 }
 
-void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
+void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, size_t dst_size, const char *in)
 {
     char *param;
     char buffer[128];
@@ -82,8 +87,11 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
     int line_start = 1;
     int an = 0;
     int end = 0;
-    int dstIdx = 0;
+    size_t dstIdx = 0;
     SrtStack stack[16];
+
+    if (dst_size == 0)
+        return;
 
     stack[0].tag[0] = 0;
     strcpy(stack[0].param[PARAM_SIZE],  "{\\fs}");
@@ -101,13 +109,13 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
             {
                 break;
             }
-            dst[dstIdx++] = '\n';
+            PUT_CH('\n');
             line_start = 1;
             break;
         case ' ':
             if (!line_start)
             {
-                dst[dstIdx++] = ' ';
+                PUT_CH(' ');
             }
             break;
         case '{':    /* skip all {\xxx} substrings except for {\an%d}
@@ -118,16 +126,18 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
                 (len = 0, sscanf(in, "{%*1[CcFfoPSsYy]:%*[^}]}%n", &len) >= 0 && len > 0))
             {
                 in += len - 1;
-            } 
+            }
             else
             {
-                dst[dstIdx++] = *in;
+                PUT_CH(*in);
             }
             break;
         case '<':
             tag_close = in[1] == '/';
             len = 0;
-            if (sscanf(in+tag_close+1, "%127[^>]>%n", buffer, &len) >= 1 && len > 0)
+            /* [^<>] not [^>]: a stray '<' inside the tag stops the match
+             * instead of running to the end of the line (upstream fix). */
+            if (sscanf(in+tag_close+1, "%127[^<>]>%n", buffer, &len) >= 1 && len > 0)
             {
                 const char *tagname = buffer;
                 while (*tagname == ' ')
@@ -241,8 +251,8 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
                     else if (unknown && !strstr(in, tmp))
                     {
                         in -= len + tag_close;
-                        dst[dstIdx++] = *in;
-                    } 
+                        PUT_CH(*in);
+                    }
                     else
                     {
                         av_strlcpy(stack[sptr++].tag, tagname,
@@ -252,7 +262,7 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
                 }
             }
         default:
-            dst[dstIdx++] = *in;
+            PUT_CH(*in);
             break;
         }
         if (*in != ' ' && *in != '\r' && *in != '\n')
@@ -265,7 +275,7 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, const char *in)
     {
         dstIdx -= 2;
     }
-    
-    dst[dstIdx] = 0;
+
+    dst[dstIdx] = 0;   /* PUT_CH keeps dstIdx <= dst_size-1 */
     rstrip_spaces_buf(dst);
 }

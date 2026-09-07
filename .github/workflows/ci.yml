@@ -1,0 +1,215 @@
+name: build deps
+
+on: [push, pull_request]
+
+jobs:
+  # ------------------------------------------------------------------ hlsdl
+  # Linux only - the deps feed is always cross-compiled for Linux and the
+  # bundled makefile has no macOS openssl handling.
+  hlsdl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev ffmpeg
+      - name: make
+        run: make -C hlsdl
+      - name: TS stream (AES-128, muxed)
+        run: |
+          timeout 180 ./hlsdl/hlsdl -b -o test.ts "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_4x3/bipbop_4x3_variant.m3u8"
+          echo "6bf11a9a4be02443d4790e43e6569a614128bad453c5cb327ec74031f6ea6382  test.ts" | sha256sum -c
+      # Needs the current hlsdl (EXT-X-MAP support). Against the old bundled
+      # 0.26 this step fails - that is the point.
+      - name: fMP4 stream (EXT-X-MAP + BYTERANGE)
+        run: |
+          set -eux
+          # the -b variant (v9) carries #EXT-X-MAP:URI="main.mp4",BYTERANGE="721@0"
+          # into a ~585 MB progressive file; a broken quote-skip makes hlsdl pull
+          # that whole file in as the "init segment" AND append the byte ranges.
+          timeout 300 ./hlsdl/hlsdl -b -o test_fmp4.mp4 "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8"
+          test -s test_fmp4.mp4
+          dd if=test_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          bytes=$(stat -c%s test_fmp4.mp4)
+          test "$bytes" -gt 50000000
+          test "$bytes" -lt 800000000
+          # ffprobe reads the whole file; -b muxes the default audio rendition,
+          # but fMP4 + separate audio is written video-only, so a leaked audio
+          # init segment is the only way an audio stream shows up here
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 test_fmp4.mp4 > streams.txt
+          cat streams.txt
+          grep -qE '^video' streams.txt
+          ! grep -qE '^audio' streams.txt
+      # Locally generated fixtures - deterministic, no network. Split into one
+      # step per case so a failure points straight at the fixture that broke.
+      - name: fixture - fMP4 EXT-X-MAP (separate init file)
+        run: |
+          set -eux
+          mkdir fx && cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=6:s=128x72 -c:v libx264 -g 15 \
+                 -f hls -hls_time 2 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 fmp4.m3u8
+          cat fmp4.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_fmp4.mp4 fmp4.m3u8
+          dd if=out_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          test "$(grep -a -o ftyp out_fmp4.mp4 | wc -l)" -eq 1
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_fmp4.mp4 | grep -q video
+      - name: fixture - single-file fMP4 (EXT-X-MAP BYTERANGE, local path)
+        run: |
+          set -eux
+          cd fx
+          # concat the init + fragments into one file and hand-write a byte-range
+          # playlist: #EXT-X-MAP:URI="blob.mp4",BYTERANGE="<n>@0" (quoted, unlike
+          # #EXT-X-BYTERANGE). A broken quote-skip reads size 0 -> local 404.
+          segs=$(grep -v '^#' fmp4.m3u8)
+          cat init.mp4 $segs > blob.mp4
+          isz=$(stat -c%s init.mp4)
+          {
+            printf '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            printf '#EXT-X-MAP:URI="blob.mp4",BYTERANGE="%d@0"\n' "$isz"
+            off=$isz
+            for s in $segs; do
+              sz=$(stat -c%s "$s")
+              printf '#EXTINF:1.0,\n#EXT-X-BYTERANGE:%d@%d\nblob.mp4\n' "$sz" "$off"
+              off=$((off + sz))
+            done
+            printf '#EXT-X-ENDLIST\n'
+          } > sf.m3u8
+          cat sf.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_sf.mp4 sf.m3u8
+          dd if=out_sf.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          # hlsdl just re-reads the byte ranges in order -> exactly blob.mp4
+          cmp -s out_sf.mp4 blob.mp4
+      - name: fixture - live fMP4, -s 0 keeps the EXT-X-MAP
+        run: |
+          set -eux
+          cd fx
+          # a live playlist (no ENDLIST); 2 s segments so -i 1 stops hlsdl
+          # cleanly (exit 0, file flushed) right after the first trimmed
+          # segment instead of spinning until a timeout kill
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' fmp4.m3u8 > live_fmp4.m3u8
+          cat live_fmp4.m3u8
+          python3 -m http.server 8199 &
+          srv=$!
+          sleep 1
+          timeout 30 ../hlsdl/hlsdl -f -s 0 -i 1 -e 1 -o out_live_fmp4.mp4 "http://127.0.0.1:8199/live_fmp4.m3u8" || true
+          kill $srv 2>/dev/null || true
+          ls -l out_live_fmp4.mp4
+          # -i 1 stops hlsdl right after the init segment, before the first
+          # trimmed media segment is written -> the output must be exactly the
+          # EXT-X-MAP init. A broken trim frees that head and the output starts
+          # with a media fragment (styp / no ftyp) instead.
+          dd if=out_live_fmp4.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+          cmp -s out_live_fmp4.mp4 init.mp4
+      - name: fixture - TS with a mid-stream EXT-X-DISCONTINUITY
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d0.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video -f mpegts d1.ts
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=64x48  -c:v mpeg2video -f mpegts d2.ts
+          printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nd0.ts\n#EXTINF:1.0,\nd1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nd2.ts\n#EXT-X-ENDLIST\n' > disc.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_disc.ts disc.m3u8
+          ffprobe -v error -show_entries format=format_name -of csv=p=0 out_disc.ts | grep -q .
+      - name: fixture - TS video + separate audio playlist (A/V merge)
+        run: |
+          set -eux
+          cd fx
+          # video-only and audio-only TS playlists; hlsdl -a muxes them into
+          # one TS via find_first_ts_packet + merge_packets
+          ffmpeg -v error -f lavfi -i testsrc=d=3:s=128x72 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'v%d.ts' vplaylist.m3u8
+          ffmpeg -v error -f lavfi -i sine=f=440:d=3 -c:a mp2 \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'a%d.ts' aplaylist.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -a aplaylist.m3u8 -o out_av.ts vplaylist.m3u8
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_av.ts | sort -u > av.txt
+          cat av.txt
+          grep -q video av.txt
+          grep -q audio av.txt
+
+  # ---------------------------------------------------------- e2isubparser
+  # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
+  # module and parses SRT + TTML (the TTML path goes through Expat).
+  e2isubparser:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: install python dev headers
+        run: sudo apt-get update && sudo apt-get -y install python3-dev
+      - name: make
+        run: make -C e2isubparser CFLAGS="-w"
+      - name: parse SRT and TTML (exercises Expat)
+        working-directory: e2isubparser
+        env:
+          # abort + report on any heap corruption, so the huge-cue test below
+          # fails loudly if the markup buffer ever overflows again
+          MALLOC_CHECK_: "3"
+        run: |
+          python3 - <<'PY'
+          import _subparser
+          print("version:", _subparser.version())
+
+          srt = "1\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
+          r = _subparser.parse(srt, 0, 1, 1, 12, 138)
+          print("srt:", r)
+          assert r, "SRT parse returned nothing"
+
+          ttml = (
+              '<?xml version="1.0" encoding="UTF-8"?>'
+              '<tt xmlns="http://www.w3.org/ns/ttml">'
+              '<body><div>'
+              '<p begin="00:00:01.000" end="00:00:03.000">Ampersand &amp; entity</p>'
+              '<p begin="00:00:04.000" end="00:00:06.000">second cue</p>'
+              '</div></body></tt>'
+          )
+          r = _subparser.parse(ttml, 0, 1, 1, 12, 138)
+          print("ttml:", r)
+          assert r, "TTML parse returned nothing"
+
+          # a single cue far longer than the internal markup buffer, with
+          # lots of <b>/<font> tags and unterminated '<' - must not overflow
+          huge = ("1\n00:00:01,000 --> 00:00:05,000\n"
+                  + ("<b>x</b> <font size=\"20\">y</font> z <<<< " * 400)
+                  + "\n\n")
+          r = _subparser.parse(huge, 0, 1, 1, 12, 138)
+          print("huge cue len:", len(r["list"][0]["text"]))
+          assert r["list"], "huge SRT parse returned nothing"
+          assert len(r["list"][0]["text"]) < 4096, "markup buffer not bounded"
+          PY
+
+  # ----------------------------------------------------------- cmdwrap / lsdir
+  small-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: make
+        run: |
+          set -eux
+          make -C cmdwrap
+          make -C lsdir
+          ./lsdir/lsdir . >/dev/null
+          ./lsdir/lsdir --version | grep -qE '^lsdir v[0-9]'
+
+  # --------------------------------------------------------------- cppcheck
+  # Static analysis of the C we maintain (not the vendored expat / vlc /
+  # ffmpeg / librtmp trees). Informational - it does not fail the build.
+  cppcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: install cppcheck
+        run: sudo apt-get update && sudo apt-get -y install cppcheck
+      - name: cppcheck
+        run: |
+          cppcheck --enable=warning,portability --inline-suppr --std=c11 \
+                   --suppress=missingIncludeSystem --suppress=missingInclude \
+                   hlsdl/src cmdwrap/src lsdir/src
+
+  # f4mdump (Adobe HDS / RTMP, Flash era) is intentionally not built here:
+  # it has no build file in the repo, pulls in a vendored librtmp, and the
+  # protocol is long dead. Add a job if it is ever touched again.

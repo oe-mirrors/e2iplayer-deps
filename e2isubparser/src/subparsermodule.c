@@ -8,8 +8,8 @@
 #define IPTV_LL_TYPE long long 
 #define IPTV_UI_TYPE unsigned int 
 
-static const char SUB_PARSER_VERSION[] = "0.5";
-static const IPTV_UI_TYPE MAX_SUBTITLE_TEXT_SIZE = 1024;
+static const char SUB_PARSER_VERSION[] = "0.6";
+static const IPTV_UI_TYPE MAX_SUBTITLE_TEXT_SIZE = 4096;
 
 
 static PyObject * get_version(PyObject *self, PyObject *unused)
@@ -72,7 +72,7 @@ static char * ass_get_text(char *str)
     return p_str;
 }
 
-static char *get_text(char *str, const int i_type, int b_removeTags, char *tmpBuffer)
+static char *get_text(char *str, const int i_type, int b_removeTags, char *tmpBuffer, size_t tmpBufferSize)
 {
     char *strPtr = str;
     if (0 != b_removeTags)
@@ -84,7 +84,7 @@ static char *get_text(char *str, const int i_type, int b_removeTags, char *tmpBu
             strPtr = ass_get_text(str);
         }
 
-        ff_htmlmarkup_to_ass(NULL, tmpBuffer, strPtr);
+        ff_htmlmarkup_to_ass(NULL, tmpBuffer, tmpBufferSize, strPtr);
         return tmpBuffer;
     }
     return str;
@@ -190,7 +190,7 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
     {
 
         /* add elems to list */
-        elem = Py_BuildValue("{s:I,s:I,s:s}", "start", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_start / 1000), "end", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_stop / 1000), "text", get_text(p_sys->subtitle[i].psz_text, p_sys->i_type, b_removeTags, pszText));
+        elem = Py_BuildValue("{s:I,s:I,s:s}", "start", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_start / 1000), "end", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_stop / 1000), "text", get_text(p_sys->subtitle[i].psz_text, p_sys->i_type, b_removeTags, pszText, MAX_SUBTITLE_TEXT_SIZE));
         PyList_SetItem(list, i, elem); // still reference no need to Py_DECREF
     }
     free(pszText);
