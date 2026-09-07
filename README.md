@@ -13,6 +13,14 @@ OE/OpenATV feed recipe.
 [![Issues](https://img.shields.io/github/issues/oe-mirrors/e2iplayer-deps?color=blue)](https://github.com/oe-mirrors/e2iplayer-deps/issues)
 ![Platform](https://img.shields.io/badge/Platform-Enigma2-orange.svg)
 
+**Component versions** (bumped by hand alongside each component's own version string)
+
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.31-blue)](hlsdl/)
+[![e2isubparser](https://img.shields.io/badge/e2isubparser-0.6-blue)](e2isubparser/)
+[![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
+[![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
+[![f4mdump](https://img.shields.io/badge/f4mdump-v0.80-blue)](f4mdump/)
+
 ## SonarCloud status
 
 Fills in once a `SONAR_TOKEN` secret is added and the project is created
@@ -88,6 +96,7 @@ Windows:  hlsdl/msvc/BUID_WINDOWS.txt
 -q ... Print less to the console.
 -o ... Choose name of output file ("-" alias for stdout).
 -f ... Force overwriting the output file.
+-R ... Resume an interrupted VOD download (keeps a <output>.hlsdl.resume sidecar).
 -F ... Force ignore detection of DRM.
 -u ... Set custom HTTP User-Agent header.
 -h ... Set custom HTTP header.

@@ -10,6 +10,7 @@
 #if !defined(__APPLE__) && !defined(__MINGW32__) && !defined(__CYGWIN__)
 #include <sys/prctl.h>
 #endif
+#include <sys/types.h>   /* off_t for ftello() in resume_checkpoint() */
 #include <unistd.h>
 #else
 #include <Windows.h>
@@ -1426,6 +1427,10 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
 
+    if (hls_args.resume) {
+        MSG_WARNING("-R (resume) has no effect on a live stream.\n");
+    }
+
     hls_playlist_updater_params updater_params;
 
     /* declaration synchronization prymitives */
@@ -1764,7 +1769,31 @@ uint8_t * find_first_ts_packet(ByteBuffer_t *buf) {
     return NULL;
 }
 
-int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio)
+/* Persist resume progress after a media segment. Flush the output, then take
+ * the byte count from the real file position rather than a running counter -
+ * that way a miscount anywhere in the writer (e.g. a short write counted in
+ * full) cannot desync the sidecar from the file. */
+static void resume_checkpoint(hls_resume_state_t *resume, write_ctx_t *out_ctx, int done, int64_t bytes)
+{
+    if (!resume) {
+        return;
+    }
+    if (out_ctx && out_ctx->opaque) {
+        FILE *f = (FILE *)out_ctx->opaque;
+        fflush(f);
+#ifdef _MSC_VER
+        __int64 pos = _ftelli64(f);
+#else
+        off_t pos = ftello(f);
+#endif
+        if (pos >= 0) {
+            bytes = (int64_t)pos;
+        }
+    }
+    resume_save(resume, done, bytes);
+}
+
+int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio, hls_resume_state_t *resume)
 {
     MSG_VERBOSE("Downloading segments.\n");
     MSG_API("{\"d_t\":\"vod\"}\n"); // d_t - download type
@@ -1776,8 +1805,16 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     assert(session);
     time_t repTime = 0;
 
+    int total_media_segments = 0;
+    for (struct hls_media_segment *t = me->first_media_segment; t; t = t->next) {
+        if (!t->is_map) {
+            total_media_segments++;
+        }
+    }
+
     uint64_t downloaded_duration_ms = 0;
-    int64_t download_size = 0;
+    int media_seg_done = resume ? resume->done : 0;
+    int64_t download_size = resume ? resume->bytes : 0;
     struct ByteBuffer seg;
     struct ByteBuffer seg_audio;
 
@@ -1785,12 +1822,47 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     struct hls_media_segment *ms_audio = NULL;
     merge_context_t merge_context;
     bool drop_audio = false;
-    bool audio_map_written = false;
+    bool audio_map_written = (resume && resume->done > 0);
 
     if (me_audio) {
         ms_audio = me_audio->first_media_segment;
         memset(&merge_context, 0x00, sizeof(merge_context));
         merge_context.out = out_ctx;
+    }
+
+    if (resume && resume->done >= total_media_segments && total_media_segments > 0) {
+        MSG_PRINT("Nothing to resume - the download was already complete.\n");
+        resume_clear(resume->out_filename);
+        if (session) {
+            clean_http_session(session);
+        }
+        return 0;
+    }
+
+    /* Fast-forward past the media segments a previous run already wrote,
+     * without fetching or writing anything. The video cursor is the one that
+     * matters; the TS+merge path keeps the audio cursor in lockstep with it
+     * (as the main loop does), and the fMP4 path does not use the audio
+     * cursor at all. */
+    if (resume && resume->done > 0) {
+        int skipped = 0;
+        while (ms && skipped < resume->done) {
+            if (ms->is_map) {
+                ms = ms->next;
+                continue;
+            }
+            if (me_audio && ms_audio && ms_audio->is_map) {
+                ms_audio = ms_audio->next;
+                continue;
+            }
+            downloaded_duration_ms += ms->duration_ms;   /* keep the progress report honest */
+            ms = ms->next;
+            if (me_audio && ms_audio) {
+                ms_audio = ms_audio->next;
+            }
+            skipped++;
+        }
+        MSG_VERBOSE("Resumed past %d segments.\n", resume->done);
     }
 
     while(ms) {
@@ -1870,6 +1942,8 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
                 repTime = curRepTime;
             }
             ms = ms->next;
+            media_seg_done++;
+            resume_checkpoint(resume, out_ctx, media_seg_done, download_size);
             continue;
         }
 
@@ -1916,6 +1990,12 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         }
 
         ms = ms->next;
+        media_seg_done++;
+        resume_checkpoint(resume, out_ctx, media_seg_done, download_size);
+    }
+
+    if (resume && ret == 0) {
+        resume_clear(resume->out_filename);
     }
 
     MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(downloaded_duration_ms / 1000), download_size);
