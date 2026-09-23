@@ -53,23 +53,25 @@ WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
         res = curl_easy_getinfo(mem->c, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &filesize);
         if((CURLE_OK == res) && (filesize>0.0))
         {
-            mem->memory = realloc(mem->memory, (int)filesize + 2);
-            if (mem->memory == NULL) {
+            char *tmp = realloc(mem->memory, (int)filesize + 2);
+            if (tmp == NULL) {
                 MSG_ERROR("not enough memory (realloc returned NULL)\n");
                 return 0;
             }
+            mem->memory = tmp;
             mem->reserved = (int)filesize + 1;
         }
     }
 
     if ((mem->size + realsize + 1) > mem->reserved)
     {
-        mem->memory = realloc(mem->memory, mem->size + realsize + 1);
-        mem->reserved = mem->size + realsize + 1;
-        if (mem->memory == NULL) {
+        char *tmp = realloc(mem->memory, mem->size + realsize + 1);
+        if (tmp == NULL) {
             MSG_ERROR("not enough memory (realloc returned NULL)\n");
             return 0;
         }
+        mem->memory = tmp;
+        mem->reserved = mem->size + realsize + 1;
     }
 
     memcpy(&(mem->memory[mem->size]), contents, realsize);
@@ -170,15 +172,29 @@ size_t get_data_from_localfile(char* filename, char** out, int64_t range_offset,
             if (fseek(fp, range_offset, SEEK_SET))
             {
                 MSG_ERROR("%s\n", strerror(errno));
+                fclose(fp);
                 return -1;
             }
             readsize = range_size;
         }
 
-        *out = (char*)malloc(sizeof(char) * readsize + 1);
-        if (fread(*out, 1, readsize, fp) != readsize) {
+        if (readsize < 0) {
+            MSG_ERROR("cannot determine the size of %s\n", filename);
+            fclose(fp);
+            return -1;
+        }
+
+        *out = (char*)malloc((size_t)readsize + 1);
+        if (*out == NULL) {
+            MSG_ERROR("out of memory\n");
+            fclose(fp);
+            return -1;
+        }
+        if (fread(*out, 1, (size_t)readsize, fp) != (size_t)readsize) {
             MSG_ERROR("fread returned less bytes than required\n");
             free(*out);
+            *out = NULL;
+            fclose(fp);
             return -1;
         }
         (*out)[readsize] = 0;
@@ -291,7 +307,7 @@ long get_data_from_url_with_session(void **ptr_session, char *url, char **out, s
     if (res != CURLE_OK) {
         MSG_ERROR("curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
         if (http_code == 200) {
-            http_code = -res;
+            http_code = -(long)res;
         }
     } else {
         if (type == STRING) {

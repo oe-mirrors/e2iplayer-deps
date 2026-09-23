@@ -174,9 +174,8 @@ static int extend_url(char **url, const char *baseurl)
             max_length = strlen(*url) + strlen(proxy_url);
             char *buffer = malloc(max_length);
             snprintf(buffer, max_length, "%s%s", proxy_url, strstr(*url, "://") + 3);
-            *url = realloc(*url, strlen(buffer) + 1);
-            strcpy(*url, buffer);
-            free(buffer);
+            free(*url);
+            *url = buffer;
         }
         return 0;
     }
@@ -184,6 +183,8 @@ static int extend_url(char **url, const char *baseurl)
         char *domain = malloc(max_length);
         strcpy(domain, baseurl);
         char proto[6];
+        // domain holds max_length > strlen(baseurl) bytes, so %[^/] cannot overflow
+        // cppcheck-suppress invalidscanf
         if( 2 == sscanf(baseurl, "%5[^:]://%[^/]", proto, domain))
         {
             char *buffer = malloc(max_length);
@@ -195,9 +196,8 @@ static int extend_url(char **url, const char *baseurl)
             {
                 snprintf(buffer, max_length, "%s://%s%s", proto, domain, *url);
             }
-            *url = realloc(*url, strlen(buffer) + 1);
-            strcpy(*url, buffer);
-            free(buffer);
+            free(*url);
+            *url = buffer;
         }
         free(domain);
         return 0;
@@ -212,9 +212,8 @@ static int extend_url(char **url, const char *baseurl)
 
         char *buffer = malloc(max_length);
         snprintf(buffer, max_length, "%s/../%s", domain, *url);
-        *url = realloc(*url, strlen(buffer) + 1);
-        strcpy(*url, buffer);
-        free(buffer);
+        free(*url);
+        *url = buffer;
         free(domain);
         return 0;
     }
@@ -234,9 +233,8 @@ static int extend_url(char **url, const char *baseurl)
         if (find_folder) {
             char* buffer = malloc(max_length);
             snprintf(buffer, max_length, "%s%s%s", folder, separator, *url);
-            *url = realloc(*url, strlen(buffer) + 1);
-            strcpy(*url, buffer);
-            free(buffer);
+            free(*url);
+            *url = buffer;
         }
         free(folder);
         return 0;
@@ -336,7 +334,10 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
     char *link_to_key = malloc(strlen(tag) + strlen(me->url) + 10);
     char iv_str[STRLEN_BTS(KEYLEN)] = "\0";
     char sep = '\0';
+    // link_to_key holds more than strlen(tag) bytes, so %[^"] cannot overflow
+    // cppcheck-suppress invalidscanf
     if ((sscanf(tag, "#EXT-X-KEY:METHOD=AES-128,URI=\"%[^\"]\",IV=0%c%32[0-9a-f]", link_to_key, &sep, iv_str) > 0 ||
+         // cppcheck-suppress invalidscanf
          sscanf(tag, "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"%[^\"]\",IV=0%c%32[0-9a-f]", link_to_key, &sep, iv_str) > 0))
     {
         if (sep == 'x' || sep == 'X')
@@ -804,8 +805,6 @@ static int sample_aes_append_av_data(ByteBuffer_t *out, ByteBuffer_t *in, const 
             // add payload
             memcpy(out->data + out->pos, av_data, av_size);
             out->pos += av_size;
-            av_data += av_size;
-            av_size -= av_size;
         }
     }
 
@@ -931,8 +930,15 @@ static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in,
         int bytes_inserted = 0;
         if (nal_size) {
             int nal_new_maxsize = nal_size * 4 / 3;
-            nal_new_start = realloc(nal_new_start, nal_new_maxsize);
-            nal_new_allocated = MAX(nal_new_allocated, nal_new_maxsize);
+            if (nal_new_maxsize > nal_new_allocated) {
+                uint8_t *tmp = realloc(nal_new_start, nal_new_maxsize);
+                if (!tmp) {
+                    MSG_ERROR("out of memory\n");
+                    break;
+                }
+                nal_new_start = tmp;
+                nal_new_allocated = nal_new_maxsize;
+            }
             bytes_inserted = insert_emulation_prev(nal_start, nal_end, nal_new_start, nal_new_start + nal_new_maxsize);
         }
         if (bytes_inserted) {
@@ -1096,8 +1102,8 @@ static int decrypt_sample_aes(hls_media_segment_t *s, ByteBuffer_t *buf)
             if (audio_PID != PID_UNSPEC || video_PID != PID_UNSPEC) {
                 uint8_t audio_counter = 0;
                 uint8_t video_counter = 0;
-                uint8_t audio_pcr[7]; // first byte is adaptation filed flags
-                uint8_t video_pcr[7]; // - || -
+                uint8_t audio_pcr[7] = {0}; // first byte is adaptation filed flags
+                uint8_t video_pcr[7] = {0}; // - || -
                 ByteBuffer_t outBuffer = {NULL};
                 outBuffer.data = malloc(buf->len * 4 / 3);
                 outBuffer.len = buf->len;

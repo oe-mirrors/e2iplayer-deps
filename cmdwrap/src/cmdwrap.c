@@ -1,13 +1,12 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#include <sys/stat.h>
-#include <sys/time.h>
+#endif
+
 #include <sys/resource.h>
 #include <unistd.h>
-#include <sched.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <malloc.h>
 #include <stdlib.h>
 
 #define MAX_WRAP_ARGS 1024
@@ -15,12 +14,13 @@
 static void *read_text_file(const char *pPath)
 {
     char *buff = NULL;
-    size_t size = 0; 
+    size_t size = 0;
     FILE *f = fopen(pPath, "r");
     if (f != NULL) {
         fseek (f, 0, SEEK_END);
-        size = ftell(f);
+        long end_pos = ftell(f);
         fseek (f, 0, SEEK_SET);
+        size = (end_pos > 0) ? (size_t)end_pos : 0;
         if (size > 0) {
             buff = malloc(size + 1);
             if (NULL == buff || size != fread(buff, 1, size, f)) {

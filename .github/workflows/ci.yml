@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install deps
         run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev ffmpeg
       - name: make
@@ -270,10 +270,10 @@ jobs:
   # Old C (VLC / ffmpeg snippets from ~2015). Goal: it links into a loadable
   # module and parses SRT + TTML (the TTML path goes through Expat).
   e2isubparser:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install python dev headers
         run: sudo apt-get update && sudo apt-get -y install python3-dev
       - name: make
@@ -322,7 +322,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: make
         run: |
           set -eux
@@ -350,7 +350,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install cppcheck
         run: sudo apt-get update && sudo apt-get -y install cppcheck
       - name: cppcheck

@@ -1,24 +1,27 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef _LARGEFILE_SOURCE
+#define _LARGEFILE_SOURCE
+#endif
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include <dirent.h>     /* Defines DT_* constants */
-#include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/time.h>
 #include <limits.h>
 #include <string.h>
 #include <fnmatch.h>
-#include <stdint.h>
-#include <errno.h>
 
 #ifndef LSDIR_VERSION
 #define LSDIR_VERSION "1.0"
 #endif
 
-#define BUF_SIZE 1024
 #define handle_error(msg) \
        do { perror(msg); exit(EXIT_FAILURE); } while (0)
        
@@ -79,22 +82,7 @@ finish:
     return ret;
 }
 
-struct linux_dirent {
-   long           d_ino;
-   off_t          d_off;
-   unsigned short d_reclen;
-   char           d_name[];
-};
-
-struct linux_dirent64 {
-    uint64_t d_ino;
-    int64_t d_off;
-    unsigned short d_reclen;
-    unsigned char d_type;
-    char d_name[];
-};
-
-char GetItemType(const char *pPath, int resolveLink, off_t *pFileSize)
+static char GetItemType(const char *pPath, int resolveLink, off_t *pFileSize)
 {
     struct stat st = {0};
     char iType = '\0';
@@ -148,7 +136,7 @@ char GetItemType(const char *pPath, int resolveLink, off_t *pFileSize)
     return iType;
 }
 
-int MatchWildcards(const char *name, char *wildcards, const unsigned int wildcardsLen)
+static int MatchWildcards(const char *name, char *wildcards, const unsigned int wildcardsLen)
 {
     if (NULL == name || NULL == wildcards)
     {
@@ -175,12 +163,7 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    int fd = -1;
-    int nRead = 0;
-    char buffer[BUF_SIZE] = {0};
-    //struct linux_dirent64 *pDir = 0;
     struct dirent *pDir = 0;
-    int bPos = 0;
     char dType = '\0';
     char iType = '\0';
     char lType = '\0';
@@ -199,7 +182,7 @@ int main(int argc, char *argv[])
     unsigned int dWildcardsLen = 0;
     unsigned int bWithSize = 0;
     
-    if(!mainDir || !tmpName)
+    if(!mainDir || !tmpName || !mountPoint)
     {
         handle_error("malloc");
     }
@@ -233,20 +216,27 @@ int main(int argc, char *argv[])
     {
         fWildcardsLen = strlen(argv[6]);
         fWildcards = malloc(fWildcardsLen + 3);
-        memset(fWildcards, '\0', dWildcardsLen + 3);
+        if(!fWildcards)
+        {
+            handle_error("malloc");
+        }
+        memset(fWildcards, '\0', fWildcardsLen + 3);
         strcpy(fWildcards, argv[6]);
-        printf("%s\n", argv[6]);
         char *p = strtok(fWildcards, "|");
-        while(p = strtok(NULL, "|"));
+        while( (p = strtok(NULL, "|")) );
     }
     if(7 < argc)
     {
         dWildcardsLen = strlen(argv[7]);
         dWildcards = malloc(dWildcardsLen + 3);
+        if(!dWildcards)
+        {
+            handle_error("malloc");
+        }
         memset(dWildcards, '\0', dWildcardsLen + 3);
         strcpy(dWildcards , argv[7]);
         char *p = strtok(dWildcards, "|");
-        while(p = strtok(NULL, "|"));
+        while( (p = strtok(NULL, "|")) );
     }
     if(8 < argc)
     {
@@ -351,15 +341,8 @@ int main(int argc, char *argv[])
                     ++iCurr;
                 }
             }
-            bPos += pDir->d_reclen;
-            
-            if(iCurr >= iEnd)
-            {
-                break;
-            }
         }
     }
-    //close(fd);
     closedir(dirp);
     if(NULL != fWildcards)
     {
@@ -371,5 +354,6 @@ int main(int argc, char *argv[])
     }
     free(mainDir);
     free(tmpName);
+    free(mountPoint);
     exit(EXIT_SUCCESS);
 }

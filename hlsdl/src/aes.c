@@ -177,6 +177,8 @@ static void KeyExpansion(void)
 
       tempa[0] =  tempa[0] ^ Rcon[i/Nk];
     }
+    // AES-256 key schedule step; unreachable with the fixed Nk 4 (AES-128)
+    // cppcheck-suppress moduloAlwaysTrueFalse
     else if (Nk > 6 && i % Nk == 4)
     {
       // Function Subword()
