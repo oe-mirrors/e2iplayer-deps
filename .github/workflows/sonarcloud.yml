@@ -23,7 +23,7 @@ jobs:
         run: echo "run=${{ secrets.SONAR_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
 
       - if: steps.gate.outputs.run == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -33,7 +33,7 @@ jobs:
 
       - name: Install SonarCloud build wrapper
         if: steps.gate.outputs.run == 'true'
-        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v5
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8
 
       - name: Build under the wrapper
         if: steps.gate.outputs.run == 'true'
@@ -47,7 +47,7 @@ jobs:
 
       - name: SonarCloud scan
         if: steps.gate.outputs.run == 'true'
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v8
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io

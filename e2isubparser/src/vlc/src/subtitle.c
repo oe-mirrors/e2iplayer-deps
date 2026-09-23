@@ -264,15 +264,20 @@ static int TextLoad( text_t *txt, const char *s )
         if( txt->i_line_count >= i_line_max )
         {
             i_line_max += 100;
-            txt->line = realloc_or_free( txt->line, i_line_max * sizeof( char * ) );
-            if( !txt->line )
+            char **lines = realloc( txt->line, i_line_max * sizeof( char * ) );
+            if( !lines )
+            {
+                TextUnload( txt );
                 return VLC_ENOMEM;
+            }
+            txt->line = lines;
         }
     }
 
     if( txt->i_line_count <= 0 )
     {
         free( txt->line );
+        txt->line = NULL;
         return VLC_EGENERIC;
     }
 
@@ -288,6 +293,7 @@ static void TextUnload( text_t *txt )
         free( txt->line[i] );
     }
     free( txt->line );
+    txt->line         = NULL;
     txt->i_line       = 0;
     txt->i_line_count = 0;
 }
