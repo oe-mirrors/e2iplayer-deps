@@ -42,6 +42,10 @@ typedef mpi * MP_t;
 #define MP_bytes(u)	mpi_size(u)
 #define MP_setbin(u,buf,len)	mpi_write_binary(u,buf,len)
 #define MP_getbin(u,buf,len)	MP_new(u); mpi_read_binary(u,buf,len)
+#define MP_setpg(dh, p, g)	dh->p = p; dh->g = g
+#define MP_setlength(dh, l)	dh->length = l
+#define MP_getp(dh)	dh->p
+#define MP_getpubkey(dh)	dh->pub_key
 
 typedef struct MDH {
   MP_t p;
@@ -93,6 +97,10 @@ typedef mpz_ptr MP_t;
 #define MP_bytes(u)	(mpz_sizeinbase(u, 2) + 7) / 8
 #define MP_setbin(u,buf,len)	nettle_mpz_get_str_256(len,buf,u)
 #define MP_getbin(u,buf,len)	u = malloc(sizeof(*u)); mpz_init2(u, 1); nettle_mpz_set_str_256_u(u,len,buf)
+#define MP_setpg(dh, p, g)	dh->p = p; dh->g = g
+#define MP_setlength(dh, l)	dh->length = l
+#define MP_getp(dh)	dh->p
+#define MP_getpubkey(dh)	dh->pub_key
 
 typedef struct MDH {
   MP_t p;
@@ -187,6 +195,17 @@ typedef BIGNUM * MP_t;
 #define MDH_generate_key(dh)	DH_generate_key(dh)
 #define MDH_compute_key(secret, seclen, pub, dh)	DH_compute_key(secret, pub, dh)
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+#define MP_setpg(dh, p, g)	DH_set0_pqg(dh, p, NULL, g)
+#define MP_setlength(dh, l)	DH_set_length(dh, l)
+#define MP_getp(dh)	DH_get0_p(dh)
+#define MP_getpubkey(dh)	DH_get0_pub_key(dh)
+#else
+#define MP_setpg(dh, p, g)	dh->p = p; dh->g = g
+#define MP_setlength(dh, l)	dh->length = l
+#define MP_getp(dh)	dh->p
+#define MP_getpubkey(dh)	dh->pub_key
+#endif
 #endif
 
 #include "log.h"
@@ -248,10 +267,8 @@ static MDH *
 DHInit(int nKeyBits)
 {
   size_t res;
-  const BIGNUM *g, *p;
   MDH *dh = MDH_new();
-
-  DH_get0_pqg(dh, &p, NULL, &g);
+  MP_t g, p;
 
   if (!dh)
     goto failed;
@@ -268,19 +285,14 @@ DHInit(int nKeyBits)
     }
 
   MP_set_w(g, 2);	/* base 2 */
+  MP_setpg(dh, p, g);
 
-  DH_set_length(dh, nKeyBits);
-
-  BN_free(g);
-  BN_free(p);
-
+  MP_setlength(dh, nKeyBits);
   return dh;
 
 failed:
   if (dh)
     MDH_free(dh);
-  BN_free(g);
-  BN_free(p);
 
   return 0;
 }
@@ -288,42 +300,35 @@ failed:
 static int
 DHGenerateKey(MDH *dh)
 {
-  const BIGNUM *g, *p, *pub_key, *priv_key;
-  size_t res = 0;
-
-  DH_get0_pqg(dh, &p, NULL, &g);
-  DH_get0_key(dh, &pub_key, &priv_key);
-
+  MP_t q1;
+  size_t res;
   if (!dh)
     return 0;
 
-  while (!res)
+  MP_gethex(q1, Q1024, res);
+  assert(res);
+
+  do
     {
-      MP_t q1 = NULL;
-
-      if (!MDH_generate_key(dh))
-	return 0;
-
-      MP_gethex(q1, Q1024, res);
-      assert(res);
-
-      res = isValidPublicKey(pub_key, p, q1);
-      if (!res)
+      if (MDH_generate_key(dh))
+        {
+	  MP_t key = (MP_t)MP_getpubkey(dh);
+	  MP_t p = (MP_t)MP_getp(dh);
+	  res = isValidPublicKey(key, p, q1);
+        }
+      else
 	{
-	  MP_free(pub_key);
-	  MP_free(priv_key);
-	  pub_key = priv_key = 0;
+#if !defined(OPENSSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x10100000
+	  MP_free(dh->pub_key);
+	  MP_free(dh->priv_key);
+	  dh->pub_key = dh->priv_key = 0;
+#endif
+	  res = 0;
+	  break;
 	}
-
-      MP_free(q1);
-    }
-
-  BN_free(g);
-  BN_free(p);
-  BN_free(pub_key);
-  BN_free(priv_key);
-
-  return 1;
+    } while (!res);
+  MP_free(q1);
+  return res;
 }
 
 /* fill pubkey with the public key in BIG ENDIAN order
@@ -333,12 +338,9 @@ DHGenerateKey(MDH *dh)
 static int
 DHGetPublicKey(MDH *dh, uint8_t *pubkey, size_t nPubkeyLen)
 {
-  const BIGNUM *pub_key;
-
-  DH_get0_key(dh, &pub_key, NULL);
-
   int len;
-  if (!dh || !pub_key)
+  MP_t pub_key;
+  if (!dh || !(pub_key = (MP_t)MP_getpubkey(dh)))
     return 0;
 
   len = MP_bytes(pub_key);
@@ -347,9 +349,6 @@ DHGetPublicKey(MDH *dh, uint8_t *pubkey, size_t nPubkeyLen)
 
   memset(pubkey, 0, nPubkeyLen);
   MP_setbin(pub_key, pubkey + (nPubkeyLen - len), len);
-
-  BN_free(pub_key);
-
   return 1;
 }
 
@@ -378,11 +377,8 @@ DHComputeSharedSecretKey(MDH *dh, uint8_t *pubkey, size_t nPubkeyLen,
 			 uint8_t *secret)
 {
   MP_t q1 = NULL, pubkeyBn = NULL;
-  const BIGNUM *p;
   size_t len;
   int res;
-
-  DH_get0_pqg(dh, &p, NULL, NULL);
 
   if (!dh || !secret || nPubkeyLen >= INT_MAX)
     return -1;
@@ -394,14 +390,13 @@ DHComputeSharedSecretKey(MDH *dh, uint8_t *pubkey, size_t nPubkeyLen,
   MP_gethex(q1, Q1024, len);
   assert(len);
 
-  if (isValidPublicKey(pubkeyBn, p, q1))
+  if (isValidPublicKey(pubkeyBn, (MP_t)MP_getp(dh), q1))
     res = MDH_compute_key(secret, nPubkeyLen, pubkeyBn, dh);
   else
     res = -1;
 
   MP_free(q1);
   MP_free(pubkeyBn);
-  BN_free(p);
 
   return res;
 }

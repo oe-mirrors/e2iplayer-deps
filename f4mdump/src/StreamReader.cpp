@@ -131,6 +131,10 @@ double IStreamReader::readDouble()
 
 std::string IStreamReader::readString(const uint32_t len)
 {
+    if(0 == len)
+    {
+        return std::string();
+    }
     std::vector<char> tmp;
     tmp.resize(len);
     if(len != read(&tmp[0], len))
@@ -167,7 +171,7 @@ std::string IStreamReader::readString()
 
 CBufferReader::CBufferReader(const ByteBuffer_t &buffer)
 : m_offset(0)
-, m_pBuffer(&buffer[0])
+, m_pBuffer(buffer.empty() ? 0 : &buffer[0])
 , m_size(buffer.size())
 {
 }
@@ -226,7 +230,7 @@ int64_t CBufferReader::seek(int32_t offset, EOffsetwhence whence)
     }
     case READER_SEEK_END:
     {
-        int64_t newOffset = m_size + m_offset;
+        int64_t newOffset = static_cast<int64_t>(m_size) + offset;
         if(newOffset <= m_size && newOffset >= 0)
         {
             m_offset = newOffset;

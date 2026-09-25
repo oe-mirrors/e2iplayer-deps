@@ -28,6 +28,7 @@
 #include <string.h>
 #include <assert.h>
 #include <time.h>
+#include <limits.h>
 
 #include "rtmp_sys.h"
 #include "log.h"
@@ -58,11 +59,6 @@ static const char *my_dhm_G = "4";
 #include <nettle/md5.h>
 #else	/* USE_OPENSSL */
 #include <openssl/ssl.h>
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-#ifndef RC4_INT
-#define RC4_INT unsigned int
-#endif
-#endif
 #include <openssl/rc4.h>
 #include <openssl/md5.h>
 #include <openssl/bio.h>
@@ -348,7 +344,7 @@ RTMP_Init(RTMP *r)
   r->m_nServerBW = 2500000;
   r->m_fAudioCodecs = 3191.0;
   r->m_fVideoCodecs = 252.0;
-  r->Link.timeout = 1;
+  r->Link.timeout = 1;	/* e2iplayer: kept from the previous vendored copy (upstream: 30) */
   r->Link.swfAge = 30;
 }
 
@@ -3557,7 +3553,6 @@ RTMP_ReadPacket(RTMP *r, RTMPPacket *packet)
   uint8_t hbuf[RTMP_MAX_HEADER_SIZE] = { 0 };
   char *header = (char *)hbuf;
   int nSize, hSize, nToRead, nChunk;
-  int didAlloc = FALSE;
   int extendedTimestamp;
 
   RTMP_Log(RTMP_LOGDEBUG2, "%s: fd=%d", __FUNCTION__, r->m_sb.sb_socket);
@@ -3651,6 +3646,9 @@ RTMP_ReadPacket(RTMP *r, RTMPPacket *packet)
 	{
 	  packet->m_nBodySize = AMF_DecodeInt24(header + 3);
 	  packet->m_nBytesRead = 0;
+	  RTMPPacket_Free(packet);
+	  if (r->m_vecChannelsIn[packet->m_nChannel])
+	    r->m_vecChannelsIn[packet->m_nChannel]->m_body = NULL;
 
 	  if (nSize > 6)
 	    {
@@ -3684,7 +3682,6 @@ RTMP_ReadPacket(RTMP *r, RTMPPacket *packet)
 	  RTMP_Log(RTMP_LOGDEBUG, "%s, failed to allocate packet", __FUNCTION__);
 	  return FALSE;
 	}
-      didAlloc = TRUE;
       packet->m_headerType = (hbuf[0] & 0xc0) >> 6;
     }
 
@@ -4434,7 +4431,7 @@ static int
 HTTP_read(RTMP *r, int fill)
 {
   char *ptr;
-  int hlen;
+  long hlen;
 
 restart:
   if (fill)
@@ -4460,7 +4457,9 @@ restart:
   }
   if (!ptr)
     return -1;
-  hlen = atoi(ptr+16);
+  hlen = strtol(ptr+16, NULL, 10);
+  if (hlen < 1 || hlen > INT_MAX)
+    return -1;
   ptr = strstr(ptr+16, "\r\n\r\n");
   if (!ptr)
     return -1;

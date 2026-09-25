@@ -4,9 +4,10 @@
    do not run here). Kept deliberately small: only what lib/xmlparse.c,
    lib/xmltok.c and lib/xmlrole.c actually look at.
 
-   Vendored Expat version: 2.6.4.  The directory is still called
-   "expat-2.2.0" so that the out-of-tree OE build recipe keeps working
-   without a path change.                                              */
+   Vendored Expat version: 2.8.5 (lib/ of the release tarball plus
+   AUTHORS/COPYING). Since 2.8 the /dev/urandom entropy code is its own
+   translation unit: random_dev_urandom.c has to be compiled together
+   with xmlparse.c, xmlrole.c and xmltok.c.                            */
 
 #ifndef EXPAT_CONFIG_H
 #define EXPAT_CONFIG_H 1
@@ -53,9 +54,9 @@
 /* Package identification. */
 #define PACKAGE_BUGREPORT "expat-bugs@libexpat.org"
 #define PACKAGE_NAME "expat"
-#define PACKAGE_STRING "expat 2.6.4"
+#define PACKAGE_STRING "expat 2.8.5"
 #define PACKAGE_TARNAME "expat"
-#define PACKAGE_VERSION "2.6.4"
+#define PACKAGE_VERSION "2.8.5"
 #define PACKAGE_URL ""
 #define VERSION PACKAGE_VERSION
 

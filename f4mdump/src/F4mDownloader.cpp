@@ -111,12 +111,14 @@ void CF4mDownloader::writeFlvFileHeader(FILE *pOutFile, const ByteBuffer_t &meta
         if(sizeof(buff) != fwrite(buff, sizeof(buff[1]), sizeof(buff), pOutFile))
             throw "Something wrong happen with writing FLV header B!";
     }
-    if(metadata.size() != fwrite(&metadata[0], sizeof(uint8_t), metadata.size(), pOutFile))
+    if(!metadata.empty() && metadata.size() != fwrite(&metadata[0], sizeof(uint8_t), metadata.size(), pOutFile))
     {
         throw "Something wrong happen with writing FLV metadata!";
     }
     {
-        uint8_t buff[] = {0x00, 0x00, 0x01, static_cast<uint8_t>(metadata.size() + TAG_HEADER_LEN) };
+        const uint32_t prevTagSize = static_cast<uint32_t>(metadata.size() + TAG_HEADER_LEN);
+        uint8_t buff[] = {static_cast<uint8_t>(prevTagSize >> 24), static_cast<uint8_t>(prevTagSize >> 16),
+                          static_cast<uint8_t>(prevTagSize >> 8), static_cast<uint8_t>(prevTagSize) };
         if(sizeof(buff) != fwrite(buff, sizeof(buff[1]), sizeof(buff), pOutFile))
             throw "Something wrong happen with writing FLV header C!";
     }
@@ -195,7 +197,9 @@ void CF4mDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
             {
                 // prepare cmd
                 std::stringstream cmd;
-                cmd << baseWgetCmd << " --tries=0 --timeout=" << WGET_TIMEOUT << " -O - " << '"' << downloadUrlBase << "Seg" << getSegmentNum(bootstrapInfoBox, currentFragment) << "-Frag" << currentFragment << '"';
+                std::stringstream fragUrl;
+                fragUrl << downloadUrlBase << "Seg" << getSegmentNum(bootstrapInfoBox, currentFragment) << "-Frag" << currentFragment;
+                cmd << baseWgetCmd << " --tries=0 --timeout=" << WGET_TIMEOUT << " -O - " << ShellQuote(fragUrl.str());
                 
                 // download fragment
                 uint32_t tries = 0;
@@ -248,14 +252,21 @@ void CF4mDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
                                     uint8_t packetType = reader.readUInt8();
                                     uint32_t packetSize = reader.readUInt24();
                                     uint32_t totalTagLen = TAG_HEADER_LEN + packetSize + PREV_TAG_SIZE;
-                                    reader.seek(-4, READER_SEEK_CUR);
+                                    if(0 > reader.seek(-4, READER_SEEK_CUR) ||
+                                       reader.offset() + totalTagLen > reader.size())
+                                    {
+                                        throw "FLV tag exceeds the fragment size!";
+                                    }
                                     
                                     switch(packetType)
                                     {
                                         case AUDIO:
                                         case VIDEO:
                                         {
-                                            reader.seek(TAG_HEADER_LEN, READER_SEEK_CUR);
+                                            if(0 > reader.seek(TAG_HEADER_LEN, READER_SEEK_CUR))
+                                            {
+                                                throw "FLV tag header seek error!";
+                                            }
                                             
                                             /* init values for VIDEO tag */
                                             uint8_t frameInfo    = reader.readUInt8();
@@ -273,7 +284,10 @@ void CF4mDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
                                                 cmpCodecID    = CODEC_ID_AAC;
                                             }
                                             
-                                            reader.seek(-(TAG_HEADER_LEN+2), READER_SEEK_CUR);
+                                            if(0 > reader.seek(-(TAG_HEADER_LEN+2), READER_SEEK_CUR))
+                                            {
+                                                throw "FLV tag header seek error!";
+                                            }
                                             
                                             if(cmpCodecID == codecID)
                                             {
@@ -310,7 +324,10 @@ void CF4mDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
                                         }
                                     }
                                     totallProcessedBytes += totalTagLen;
-                                    reader.seek(totalTagLen, READER_SEEK_CUR);
+                                    if(0 > reader.seek(totalTagLen, READER_SEEK_CUR))
+                                    {
+                                        throw "FLV tag seek error!";
+                                    }
                                 }
                             }
                             else
@@ -323,7 +340,11 @@ void CF4mDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
                         {
                             std::string boxType(header.boxType, sizeof(header.boxType));
                             printDBG("Box type [%s] skipped\n", boxType.c_str());
-                            reader.seek(header.payloadSize, READER_SEEK_CUR);
+                            if(header.payloadSize > static_cast<uint64_t>(reader.size() - reader.offset()) ||
+                               0 > reader.seek(static_cast<int32_t>(header.payloadSize), READER_SEEK_CUR))
+                            {
+                                throw "Box exceeds the fragment size!";
+                            }
                         }
                     }
                 }
@@ -396,6 +417,10 @@ void CF4mDownloader::terminate()
 uint32_t CF4mDownloader::getSegmentNum(const F4VBootstrapInfoBox &iBox, const uint32_t &iCurrentFragment)
 {
     uint32_t oSegForFrag = 1; // default value when only fragment mode is used
+    if(iBox.fragmentRunTableEntries.empty() || iBox.segmentRunTableEntries.empty())
+    {
+        return oSegForFrag;
+    }
     
     const F4VFragmentRunTableBox &fragmentRunTableItem = iBox.fragmentRunTableEntries[0];
     const FragmentRunEntryArray_t &fragTable = fragmentRunTableItem.fragmentRunEntryTable;
@@ -428,6 +453,10 @@ void CF4mDownloader::updateBootstrapInfo(const F4VBootstrapInfoBox &iBox, uint32
 {
     uint32_t firstFragment    = static_cast<uint32_t>(-1);
     uint32_t lastFragment     = 0;
+    if(iBox.fragmentRunTableEntries.empty() || iBox.segmentRunTableEntries.empty())
+    {
+        throw "Bootstrap without fragment or segment run table!";
+    }
 
     const F4VFragmentRunTableBox &runTableItem = iBox.fragmentRunTableEntries[0];
     const FragmentRunEntryArray_t &fragTable = runTableItem.fragmentRunEntryTable;

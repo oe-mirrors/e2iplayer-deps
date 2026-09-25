@@ -28,12 +28,12 @@ bool CF4MParser::getManifest(const string &inData)
     
     XMLDocument doc;
     XMLError xmlError = doc.Parse(inData.c_str(), inData.size());
-    if(XML_NO_ERROR == xmlError)
+    if(XML_SUCCESS == xmlError)
     {
         printDBG("Manifest parser error [%d]\n", xmlError);
     
         XMLElement *levelElement = doc.FirstChildElement(add_ns("media").c_str());
-        for(XMLElement* child = levelElement->FirstChildElement(); child != NULL; child = child->NextSiblingElement())
+        for(XMLElement* child = levelElement ? levelElement->FirstChildElement() : NULL; child != NULL; child = child->NextSiblingElement())
         {
             // do something with each child element
         }

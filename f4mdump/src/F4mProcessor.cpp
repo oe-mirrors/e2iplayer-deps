@@ -129,10 +129,18 @@ void ReadBoxHeader(IStreamReader &buffer, F4VBoxHeader &header)
     if(1 == header.payloadSize) // extended size available
     {
         header.payloadSize  = buffer.readUInt64();
+        if(16 > header.payloadSize)
+        {
+            throw "ReadBoxHeader box size too small";
+        }
         header.payloadSize -= 16;
     }
     else
     {
+        if(8 > header.payloadSize)
+        {
+            throw "ReadBoxHeader box size too small";
+        }
         header.payloadSize -= 8;
     }
 }

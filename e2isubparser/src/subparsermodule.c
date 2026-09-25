@@ -8,7 +8,7 @@
 #define IPTV_LL_TYPE long long 
 #define IPTV_UI_TYPE unsigned int 
 
-static const char SUB_PARSER_VERSION[] = "0.7";
+static const char SUB_PARSER_VERSION[] = "0.9";
 static const IPTV_UI_TYPE MAX_SUBTITLE_TEXT_SIZE = 4096;
 
 
@@ -49,6 +49,35 @@ static uint32_t words(const char sentence[ ])
     return counted;
 }
 
+/* PUT_CH in ff_htmlmarkup_to_ass() cuts at a byte limit: drop an incomplete
+ * UTF-8 sequence at the end, Py_BuildValue("s") would fail on it */
+static void utf8_trim_incomplete(char *str)
+{
+    size_t len = strlen(str);
+    size_t i = len;
+    size_t need = 0;
+    unsigned char c = 0;
+    /* go back to the lead byte of the last character (max. 3 continuation bytes) */
+    while (i > 0 && len - i < 4 && (((unsigned char)str[i - 1]) & 0xC0) == 0x80)
+    {
+        --i;
+    }
+    if (0 == i)
+    {
+        return;
+    }
+    c = (unsigned char)str[i - 1];
+    if (c < 0x80)
+    {
+        return;
+    }
+    need = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+    if ((len - (i - 1)) < need)
+    {
+        str[i - 1] = '\0';
+    }
+}
+
 static char * ass_get_text(char *str)
 {
     // Events are stored in the Block in this order:
@@ -85,6 +114,7 @@ static char *get_text(char *str, const int i_type, int b_removeTags, char *tmpBu
         }
 
         ff_htmlmarkup_to_ass(NULL, tmpBuffer, tmpBufferSize, strPtr);
+        utf8_trim_incomplete(tmpBuffer);
         return tmpBuffer;
     }
     return str;
@@ -129,8 +159,13 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
         return NULL;
     }
     
-    retObj = PyDict_New();  
-    
+    retObj = PyDict_New();
+    if (NULL == retObj)
+    {
+        free(pszText);
+        return NULL;
+    }
+
     if ( 0 != VLC_SubtitleDemuxOpen( inputStr, i_microsecperframe, &p_sys ) || NULL == p_sys )
     {
         free(pszText);
@@ -148,9 +183,9 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
                  * http://www.raco.cat/index.php/QuadernsTraduccio/article/viewFile/265461/353045
                  */
                 /* calc end time based on CPS (characters per second) */
-                const int64_t timeBasedOnCPS = (strlen(p_sys->subtitle[i-1].psz_text) * 1000000) / i_CPS; 
+                const int64_t timeBasedOnCPS = ((int64_t)strlen(p_sys->subtitle[i-1].psz_text) * 1000000) / i_CPS;
                 /* calc end time based on WPM (Words per minute) */
-                const int64_t timeBasedOnWPM = (words(p_sys->subtitle[i-1].psz_text) * 60000000) / i_WPM ; 
+                const int64_t timeBasedOnWPM = ((int64_t)words(p_sys->subtitle[i-1].psz_text) * 60000000) / i_WPM;
                 int64_t time = timeBasedOnCPS > timeBasedOnWPM ? timeBasedOnCPS : timeBasedOnWPM;
                 if (time < 1500000) /* at least 1,5s */
                 {
@@ -170,14 +205,14 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
             /* Fix last subtitle */
             if (i == (p_sys->i_subtitles - 1) && 0 > p_sys->subtitle[i].i_stop)
             {
-                const int64_t timeBasedOnCPS = (int64_t)(strlen(p_sys->subtitle[i].psz_text) * 1000000) / i_CPS; 
-                const int64_t timeBasedOnWPM = (int64_t)(words(p_sys->subtitle[i].psz_text) * 60000000) / i_WPM ; 
+                const int64_t timeBasedOnCPS = ((int64_t)strlen(p_sys->subtitle[i].psz_text) * 1000000) / i_CPS;
+                const int64_t timeBasedOnWPM = ((int64_t)words(p_sys->subtitle[i].psz_text) * 60000000) / i_WPM;
                 int64_t time = timeBasedOnCPS > timeBasedOnWPM ? timeBasedOnCPS : timeBasedOnWPM;
                 if (time < 2000000) /* at least 2s */
                 {
                     time = 2000000;
                 }
-                p_sys->subtitle[i].i_stop = time;
+                p_sys->subtitle[i].i_stop = p_sys->subtitle[i].i_start + time;
             }
         }
     }
@@ -185,12 +220,28 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
     
     /* create list */
     list = PyList_New(p_sys->i_subtitles);
-    
+    if (NULL == list)
+    {
+        free(pszText);
+        VLC_SubtitleDemuxClose( p_sys );
+        Py_DECREF(retObj);
+        return NULL;
+    }
+
     for (i=0; i<p_sys->i_subtitles; ++i)
     {
 
         /* add elems to list */
         elem = Py_BuildValue("{s:I,s:I,s:s}", "start", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_start / 1000), "end", (IPTV_UI_TYPE)(p_sys->subtitle[i].i_stop / 1000), "text", get_text(p_sys->subtitle[i].psz_text, p_sys->i_type, b_removeTags, pszText, MAX_SUBTITLE_TEXT_SIZE));
+        if (NULL == elem)
+        {
+            /* e.g. text that is no valid UTF-8 - report the error, never put NULL into the list */
+            free(pszText);
+            VLC_SubtitleDemuxClose( p_sys );
+            Py_DECREF(list);
+            Py_DECREF(retObj);
+            return NULL;
+        }
         PyList_SetItem(list, i, elem); // still reference no need to Py_DECREF
     }
     free(pszText);
@@ -203,14 +254,16 @@ static PyObject * _subparser_parse(PyObject *self, PyObject *args)
     /* add subtitles format to return dict */
     /* elem = PyInt_FromLong((long) p_sys->i_type); */
 #if PY_MAJOR_VERSION >= 3
-    elem = PyUnicode_FromString( p_sys->psz_type_name );
+    elem = PyUnicode_FromString( p_sys->psz_type_name ? p_sys->psz_type_name : "" );
 #else
-    elem = PyString_FromString( p_sys->psz_type_name );
+    elem = PyString_FromString( p_sys->psz_type_name ? p_sys->psz_type_name : "" );
 #endif
 
-
-    PyDict_SetItemString(retObj, "type", elem); 
-    Py_DECREF(elem); // PyDict_SetItemString not still reference but incement it
+    if (elem)
+    {
+        PyDict_SetItemString(retObj, "type", elem);
+        Py_DECREF(elem); // PyDict_SetItemString not still reference but incement it
+    }
     
     VLC_SubtitleDemuxClose( p_sys );
     
@@ -233,9 +286,12 @@ static PyObject* _subparser_strip_html_tags(PyObject *self, PyObject *args, PyOb
 #if PY_MAJOR_VERSION >= 3
 
     if (!PyUnicode_Check(string))
+    {
+        PyErr_SetString(PyExc_TypeError, "strip_html_tags: str expected");
         return NULL;
+    }
 
-    in = PyUnicode_AsUTF8AndSize(string, &isize);
+    in = (char *)PyUnicode_AsUTF8AndSize(string, &isize);
     if (in == NULL) {
         return NULL; // not a string object or it contains null bytes
     }
@@ -243,7 +299,10 @@ static PyObject* _subparser_strip_html_tags(PyObject *self, PyObject *args, PyOb
 #else
 
     if (!PyString_Check(string))
+    {
+        PyErr_SetString(PyExc_TypeError, "strip_html_tags: str expected");
         return NULL;
+    }
 
     if (PyString_AsStringAndSize(string, &in, &isize) == -1) {
         return NULL; // not a string object or it contains null bytes

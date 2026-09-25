@@ -23,7 +23,9 @@ int bidirpipe(int pfd[], const char *cmd , const char * const argv[], const char
         return(-1);
     }
 
-    if ( ( pid = vfork() ) == -1 )
+    /* fork, not vfork: the child calls setsid/close/dup/chdir before exec, which is
+     * not allowed after vfork (it shares the parent's memory until exec) */
+    if ( ( pid = fork() ) == -1 )
     {
         return(-1);
     }
@@ -61,7 +63,6 @@ int bidirpipe(int pfd[], const char *cmd , const char * const argv[], const char
         }
 
         execvp(cmd, (char * const *)argv);
-        /* the vfork will actually suspend the parent thread until execvp is called. thus it's ok to use the shared arg/cmdline pointers here. */
         _exit(0);
     }
     if (close(pfdout[0]) == -1 || close(pfdin[1]) == -1 || close(pfderr[1]) == -1)

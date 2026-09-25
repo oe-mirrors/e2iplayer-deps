@@ -57,7 +57,7 @@ bool CManifestParser::getManifest(const string &url, XMLDocument &xmlDoc)
     if(bRet)
     {
         XMLError xmlError = xmlDoc.Parse(output.c_str(), output.size());
-        if(xmlError != XML_NO_ERROR)
+        if(xmlError != XML_SUCCESS)
         {
             printDBG("XML parse Error\n");
             bRet = false;
@@ -77,7 +77,7 @@ bool CManifestParser::getPage(const string &url, string &data)
     
     // prepare cmd
     std::stringstream cmd;
-    cmd << m_sWgetCMD << " --tries=0 --timeout=10 -O - " << '"' << url << '"';
+    cmd << m_sWgetCMD << " --tries=0 --timeout=10 -O - " << ShellQuote(url);
     
     // download
     int retval = ConsoleAppContainer::getInstance().execute(cmd.str().c_str(), inData, errData);
@@ -98,7 +98,7 @@ void  CManifestParser::refreshBootstrap(const std::string &bootstrapUrl, MediaEn
     
     // prepare cmd
     std::stringstream cmd;
-    cmd << m_sWgetCMD << " --tries=0 --timeout=10 -O - " << '"' << bootstrapUrl << '"';
+    cmd << m_sWgetCMD << " --tries=0 --timeout=10 -O - " << ShellQuote(bootstrapUrl);
     CRawConsoleBuffer inData;
     CStrConsoleBuffer errData;
     int32_t retval = ConsoleAppContainer::getInstance().execute(cmd.str().c_str(), inData, errData);
@@ -309,7 +309,7 @@ bool CManifestParser::addMediaEntries(const std::string &url,
                     {
                         break;
                     }
-                    pBootstrapInfo = pRoot->NextSiblingElement("bootstrapInfo");
+                    pBootstrapInfo = pBootstrapInfo->NextSiblingElement("bootstrapInfo");
                 }
             }
 

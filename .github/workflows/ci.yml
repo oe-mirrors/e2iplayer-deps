@@ -151,6 +151,26 @@ jobs:
           timeout 30 ../hlsdl/hlsdl -f -o out_mapkey.mp4 mapkey.m3u8
           # the init segment must come out decrypted (ftyp box), not ciphertext
           dd if=out_mapkey.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
+      - name: fixture - AES-128 IV in upper case, IV before URI
+        run: |
+          set -eux
+          cd fx
+          # RFC 8216 writes the IV hex digits in upper case and the attributes may
+          # come in any order; a wrong IV only breaks the first 16 bytes of each
+          # segment, i.e. exactly the ftyp box checked below
+          IVU=A1B2C3D4E5F60718293A4B5C6D7E8F90
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 enc.key)" -iv "$IVU" -in ki.mp4 -out ki_u.mp4.enc
+          {
+            printf '#EXTM3U\n#EXT-X-VERSION:5\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            printf '#EXT-X-MAP:URI="ki_u.mp4.enc"\n'
+            printf '#EXT-X-KEY:METHOD=AES-128,IV=0X%s,URI="enc.key",KEYFORMAT="identity"\n' "$IVU"
+            printf '#EXTINF:2.0,\nseg0_u.enc\n#EXT-X-ENDLIST\n'
+          } > mapkey_u.m3u8
+          seg=$(grep -v '^#' ki.m3u8 | head -1)
+          openssl aes-128-cbc -e -K "$(xxd -p -c 32 enc.key)" -iv "$IVU" -in "$seg" -out seg0_u.enc
+          cat mapkey_u.m3u8
+          timeout 30 ../hlsdl/hlsdl -f -o out_mapkey_u.mp4 mapkey_u.m3u8
+          dd if=out_mapkey_u.mp4 bs=1 skip=4 count=4 2>/dev/null | grep -q ftyp
       - name: fixture - unreachable segment fails the download
         run: |
           set -eux
@@ -315,7 +335,51 @@ jobs:
           print("huge cue len:", len(r["list"][0]["text"]))
           assert r["list"], "huge SRT parse returned nothing"
           assert len(r["list"][0]["text"]) < 4096, "markup buffer not bounded"
+
+          # a cue longer than the markup buffer, cut inside a multi-byte
+          # character, must still give a valid list (no NULL entry / error)
+          umlaut = "1\n00:00:01,000 --> 00:00:05,000\n" + ("\u00e4" * 3000) + "\n\n"
+          r = _subparser.parse(umlaut, 0, 1, 1, 12, 138)
+          assert r["list"] and isinstance(r["list"][0]["text"], str), "cut UTF-8 cue"
+
+          # a cue without end time: the last one must end after it starts
+          mdvd = "{25}{}first\n{50}{}last cue\n"
+          r = _subparser.parse(mdvd, 40000, 1, 1, 12, 138)
+          print("microdvd:", r)
+          last = r["list"][-1]
+          assert last["end"] > last["start"], "last cue ends before it starts"
           PY
+      - name: parsers never loop forever
+        working-directory: e2isubparser
+        run: |
+          python3 - <<'PY'
+          import multiprocessing as mp
+
+          def work(s, q):
+              import _subparser
+              q.put(_subparser.parse(s, 0, 1, 1, 12, 138))
+
+          def parse_with_timeout(s, sec=10):
+              q = mp.Queue()
+              p = mp.Process(target=work, args=(s, q))
+              p.start()
+              p.join(sec)
+              if p.is_alive():
+                  p.terminate()
+                  raise SystemExit("parser did not finish within %d s: %r" % (sec, s[:80]))
+              return q.get(timeout=5)
+
+          # several SAMI SYNC entries on one line used to repeat the first one forever
+          sami = "<SAMI><BODY><SYNC Start=1000><P>Hi<SYNC Start=2000><P>there<SYNC Start=3000><P>&nbsp;</BODY></SAMI>"
+          r = parse_with_timeout(sami)
+          print("sami:", r)
+          assert [c["start"] for c in r["list"]][:2] == [1000, 2000], "SAMI entries"
+
+          # malformed SRT-like input found by fuzzing (hung before the fix)
+          fuzz = (":199]:99:,799 -->: -1:00:00,&000\nx\n\n2001-> m3> \n\n:00:01,000 \n0:00:1-> > \n\n\n"
+                  "9,9[,99 --> -1:00:00,&00\nx\n\n26\n00:00:01,000 \n00:00:\\01-> m3> \n\n")
+          parse_with_timeout(fuzz)
+          print("fuzz case finished")
 
   # ----------------------------------------------------------- cmdwrap / lsdir
   small-tools:
@@ -359,6 +423,55 @@ jobs:
                    --suppress=missingIncludeSystem --suppress=missingInclude \
                    hlsdl/src cmdwrap/src lsdir/src
 
-  # f4mdump (Adobe HDS / RTMP, Flash era) is intentionally not built here:
-  # it has no build file in the repo, pulls in a vendored librtmp, and the
-  # protocol is long dead. Add a job if it is ever touched again.
+  # ---------------------------------------------------------------- f4mdump
+  # f4mdump has no build file in the repo: build it from the same sources and
+  # with the same compiler flags as the OE recipe
+  # (enigma2-plugin-extensions-e2iplayer-deps.bb, S5/S6), libraries last for
+  # the as-needed linker. Then let it list the qualities of a local HDS
+  # manifest - that runs the vendored TinyXML-2 on a real document.
+  f4mdump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: install build deps
+        run: sudo apt-get update && sudo apt-get -y install libssl-dev zlib1g-dev
+      - name: build
+        working-directory: f4mdump
+        run: |
+          set -eux
+          # compiler errors also go out as annotations (readable without the log)
+          report() { grep -E 'error|undefined reference' build.log | head -n 30 | sed 's/^/::error::/'; exit 1; }
+          gcc ext/librtmp/amf.c ext/librtmp/hashswf.c ext/librtmp/log.c \
+              ext/librtmp/parseurl.c ext/librtmp/rtmp.c \
+              -c -fdata-sections -ffunction-sections -Os \
+              -Wno-incompatible-pointer-types -Iext/librtmp > build.log 2>&1 || report
+          g++ src/b64.c src/F4mDownloader.cpp src/F4mProcessor.cpp \
+              src/ManifestParser.cpp src/RTMPTypes.cpp src/RTMPWrapper.cpp \
+              src/SimpleFunctions.cpp src/StreamReader.cpp src/StringHelper.cpp \
+              src/UdsDownloader.cpp src/console.cpp src/main.cpp src/parser.cpp \
+              src/tinyxml2.cpp \
+              -Os -Wno-narrowing -std=c++0x -Iinc -Iext -Iext/librtmp \
+              *.o -o f4mdump -lssl -lcrypto -lz > build.log 2>&1 || report
+          # printInf() writes to stderr
+          ./f4mdump 2>&1 | grep -qE '^F4MDump v[0-9]'
+      - name: list qualities of a local HDS manifest
+        working-directory: f4mdump
+        run: |
+          set -eux
+          mkdir -p /tmp/hds
+          cat > /tmp/hds/manifest.f4m <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest xmlns="http://ns.adobe.com/f4m/1.0">
+            <baseURL>http://127.0.0.1:8765</baseURL>
+            <bootstrapInfo profile="named" id="boot_low">AAAAAA==</bootstrapInfo>
+            <bootstrapInfo profile="named" id="boot_high">AAAAAA==</bootstrapInfo>
+            <media streamId="high" url="high" bitrate="1500" bootstrapInfoId="boot_high"/>
+            <media streamId="low" url="low" bitrate="500" bootstrapInfoId="boot_low"/>
+          </manifest>
+          EOF
+          (cd /tmp/hds && python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for i in $(seq 1 20); do curl -fs http://127.0.0.1:8765/manifest.f4m >/dev/null && break; sleep 0.5; done
+          out=$(./f4mdump "wget -q" "http://127.0.0.1:8765/manifest.f4m" 2>&1)
+          echo "$out"
+          echo "$out" | grep -qF '"qualities":[500, 1500]'

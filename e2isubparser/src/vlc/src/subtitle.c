@@ -168,34 +168,19 @@ void strnormalize_space(char *str)
 
 char *strtrim(char *str, const char *whiteSpaces)
 {
-    size_t len = 0;
+    /* the old version wrote one byte past the buffer for a string that
+     * consisted only of white space (e.g. "\n" between TTML tags) */
     char *frontp = str;
-    char *endp = NULL;
+    size_t len = 0;
 
     if( str == NULL ) { return NULL; }
-    if( str[0] == '\0' ) { return str; }
 
-    len = strlen(str);
-    endp = str + len;
+    while( *frontp && strchr(whiteSpaces, *frontp) ) { ++frontp; }
+    len = strlen(frontp);
+    while( len > 0 && strchr(whiteSpaces, frontp[len - 1]) ) { --len; }
 
-    while(*frontp && strchr(whiteSpaces, *frontp) ) { ++frontp; }
-    if( endp != frontp )
-    {
-        while( strchr(whiteSpaces, *(--endp)) && endp != frontp ) {}
-    }
-
-    if( str + len - 1 != endp )
-            *(endp + 1) = '\0';
-    else if( frontp != str &&  endp == frontp )
-            *str = '\0';
-    
-    endp = str;
-    if( frontp != str )
-    {
-            while( *frontp ) { *endp++ = *frontp++; }
-            *endp = '\0';
-    }
-
+    memmove(str, frontp, len);
+    str[len] = '\0';
     return str;
 }
  
@@ -507,6 +492,7 @@ int VLC_SubtitleDemuxOpen( const char *subStr, const int i_microsecperframe, dem
     demux.p_sys = p_sys;
     
     p_sys->psz_header         = NULL;
+    p_sys->psz_sami_pos       = NULL;
     p_sys->i_subtitle         = 0;
     p_sys->i_subtitles        = 0;
     p_sys->subtitle           = NULL;
@@ -565,11 +551,17 @@ int VLC_SubtitleDemuxOpen( const char *subStr, const int i_microsecperframe, dem
                 }
             }
 
+            const int i_line_before = p_sys->txt.i_line;
             if( pf_read( &demux, &p_sys->subtitle[p_sys->i_subtitles],
                          p_sys->i_subtitles ) )
                 break;
 
             p_sys->i_subtitles++;
+
+            /* the parser did not move on (e.g. stepped back with TextPreviousLine
+             * and would find the same entry again): stop instead of looping forever */
+            if( p_sys->txt.i_line <= i_line_before && NULL == p_sys->psz_sami_pos )
+                break;
         }
         
         /* Unload */
@@ -1030,8 +1022,10 @@ static int  ParseSami( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
     unsigned int i_text;
     char text[8192]; /* Arbitrary but should be long enough */
 
-    /* search "Start=" */
-    if( !( s = ParseSamiSearch( txt, NULL, "Start=" ) ) )
+    /* search "Start=" - on the same line as the previous entry if it ended there */
+    s = ParseSamiSearch( txt, p_sys->psz_sami_pos, "Start=" );
+    p_sys->psz_sami_pos = NULL;
+    if( !s )
         return VLC_EGENERIC;
 
     /* get start value */
@@ -1065,7 +1059,9 @@ static int  ParseSami( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
             }
             else if( strcasestr( s, "Start=" ) )
             {
-                TextPreviousLine( txt );
+                /* the next entry starts here: remember the position instead of
+                 * stepping back a line, which re-read the same entry forever */
+                p_sys->psz_sami_pos = s;
                 break;
             }
             s = ParseSamiSearch( txt, s, ">" );
@@ -1242,6 +1238,8 @@ static int ParseAQT( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
     char *psz_text = strdup( "" );
     int i_old = 0;
     int i_firstline = 1;
+    if( !psz_text )
+        return VLC_ENOMEM;
 
     for( ;; )
     {
@@ -1343,6 +1341,8 @@ static int ParseMPSub( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
     demux_sys_t *p_sys = p_demux->p_sys;
     text_t      *txt = &p_sys->txt;
     char *psz_text = strdup( "" );
+    if( !psz_text )
+        return VLC_ENOMEM;
 
     if( !p_sys->mpsub.b_inited )
     {
@@ -1591,6 +1591,11 @@ static int ParseJSS( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
 
     /* Clean all the lines from inline comments and other stuffs */
     psz_orig2 = calloc( strlen( psz_text) + 1, 1 );
+    if( !psz_orig2 )
+    {
+        free( psz_orig );
+        return VLC_ENOMEM;
+    }
     psz_text2 = psz_orig2;
 
     for( ; *psz_text != '\0' && *psz_text != '\n' && *psz_text != '\r'; )
@@ -1757,7 +1762,7 @@ static int ParseRealText( demux_t *p_demux, subtitle_t *p_subtitle, int i_idx )
         char *psz_temp = strcasestr( s, "<time");
         if( psz_temp != NULL )
         {
-            char psz_end[12], psz_begin[12];
+            char psz_end[12] = "", psz_begin[12] = "";
             /* Line has begin and end */
             if( ( sscanf( psz_temp,
                   "<%*[t|T]ime %*[b|B]egin=\"%11[^\"]\" %*[e|E]nd=\"%11[^\"]%*[^>]%[^\n\r]",
