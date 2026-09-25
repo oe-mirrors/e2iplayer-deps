@@ -1198,10 +1198,10 @@ AMF_Decode(AMFObject *obj, const char *pBuffer, int nSize, int bDecodeName)
 
       if (bError)
 	{
-    /*
+	  /* e2iplayer: silenced, as in the previous vendored copy
 	  RTMP_Log(RTMP_LOGERROR,
 	      "DECODING ERROR, IGNORING BYTES UNTIL NEXT KNOWN PATTERN!");
-          */
+	  */
 	  nSize--;
 	  pBuffer++;
 	  continue;

@@ -15,11 +15,11 @@ OE/OpenATV feed recipe.
 
 **Component versions** (bumped by hand alongside each component's own version string)
 
-[![hlsdl](https://img.shields.io/badge/hlsdl-v0.31-blue)](hlsdl/)
-[![e2isubparser](https://img.shields.io/badge/e2isubparser-0.7-blue)](e2isubparser/)
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.32-blue)](hlsdl/)
+[![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
 [![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
-[![f4mdump](https://img.shields.io/badge/f4mdump-v0.80-blue)](f4mdump/)
+[![f4mdump](https://img.shields.io/badge/f4mdump-v0.82-blue)](f4mdump/)
 
 ## SonarCloud status
 
@@ -57,7 +57,8 @@ Command-line argument splitter.
 ## e2isubparser
 
 Python C-extension for text subtitle parsing (SRT / SSA / TTML / EBU-TT).
-The TTML path uses a vendored [Expat](https://libexpat.github.io/).
+The TTML path uses a vendored [Expat](https://libexpat.github.io/) 2.8.5
+(`e2isubparser/src/expat`, the `lib/` sources of the release tarball).
 
 ## f4mdump
 
@@ -132,8 +133,8 @@ This repository ships more than one license:
 | `lsdir`, `cmdwrap`, `e2isubparser`, `f4mdump` | GPLv3, released as part of [E2iPlayer](https://github.com/oe-mirrors/e2iplayer) — see its [LICENSE.txt](https://github.com/oe-mirrors/e2iplayer/blob/python3/LICENSE.txt) |
 | vendored Expat (in `e2isubparser`) | MIT |
 | vendored VLC / FFmpeg subtitle snippets (in `e2isubparser`) | LGPL 2.1+ |
-| vendored librtmp (in `f4mdump`) | LGPL 2.1 — see [f4mdump/ext/librtmp/COPYING](f4mdump/ext/librtmp/COPYING) |
-| vendored TinyXML-2 (in `f4mdump`) | zlib |
+| vendored librtmp from rtmpdump v2.6 (in `f4mdump`) | LGPL 2.1 — see [f4mdump/ext/librtmp/COPYING](f4mdump/ext/librtmp/COPYING) |
+| vendored TinyXML-2 11.0.0 (in `f4mdump`) | zlib |
 
 The E2iPlayer-authored components are free software; you can redistribute
 them and/or modify them under the terms of the GNU General Public License

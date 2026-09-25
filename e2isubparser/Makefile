@@ -15,13 +15,16 @@ PYTHON_INCLUDES ?= $(shell $(PYTHON_CONFIG) --includes)
 
 MODULE   = _subparser.so
 
-# expat/ (2.6.4+) or the legacy expat-2.2.0/ - whichever is present
+# expat/ (2.8.5) or the legacy expat-2.2.0/ - whichever is present;
+# random_dev_urandom.c only exists (and is needed) since Expat 2.8
 EXPATDIR = $(firstword $(wildcard src/expat src/expat-2.2.0))
+EXPATRANDOM = $(wildcard $(EXPATDIR)/random_dev_urandom.c)
 
 SRC = src/subparsermodule.c \
       src/vlc/src/subtitle.c \
       src/ffmpeg/src/htmlsubtitles.c \
       $(EXPATDIR)/xmlparse.c $(EXPATDIR)/xmlrole.c $(EXPATDIR)/xmltok.c \
+      $(EXPATRANDOM) \
       $(wildcard src/ttml/src/*.c) \
       $(wildcard src/html/src/*.c)
 
@@ -32,7 +35,10 @@ override CFLAGS += -Os -fPIC -fno-strict-aliasing \
                    -ffunction-sections -fdata-sections \
                    -DNDEBUG -DHAVE_EXPAT_CONFIG_H \
                    -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE -D_LARGEFILE_SOURCE
-override LDFLAGS += -Wl,--gc-sections
+# -Bsymbolic: bind the Expat calls to the vendored copy inside the module;
+# otherwise an Expat already loaded into the Python process (the system
+# libexpat) takes precedence and the vendored version is never used
+override LDFLAGS += -Wl,--gc-sections -Wl,-Bsymbolic
 
 # llroundf() from the TTML/HTML code - the OE recipe links it explicitly too
 LDLIBS ?= -lm

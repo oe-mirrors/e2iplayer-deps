@@ -68,6 +68,11 @@ static int ParseTimingValueTTML(int64_t *timing_value, const char *s)
             }
             /* TODO: add support for "f" (frames), "t" (ticks) metric */
             
+            /* reject values that do not fit (the result is in microseconds) */
+            if (0 == status && (value != value || value > 9.2e15f || value < -9.2e15f))
+            {
+                status = -1;
+            }
             if (0 == status)
             {
                 (*timing_value) = (int64_t)(value) * 1000;
@@ -175,6 +180,11 @@ static void XMLCALL DataElementTTML(void *userData, const char *content, int len
     if (p_sys->ttml.b_isParagraph)
     {
         char *tmp = malloc(length+1);
+        if (NULL == tmp)
+        {
+            p_sys->ttml.i_status = VLC_ENOMEM;
+            return;
+        }
         strncpy(tmp, content, length);
         tmp[length] = '\0';
         strtrim(tmp, "\n");

@@ -26,6 +26,8 @@ bool ReadWholeFile(const std::string &filePath, ByteBuffer_t &buffer);
 size_t replace_fwrite(const void* buff, size_t size, size_t count, FILE* file);
 
 bool IsHttpUrl(const std::string &url);
+/* single-quote an argument for /bin/sh -c: nothing inside '...' is expanded */
+std::string ShellQuote(const std::string &arg);
 void b64decode(const std::string &str, ByteBuffer_t &buff);
 
 #endif //_SIMPLE_FUNCTIONS_H_

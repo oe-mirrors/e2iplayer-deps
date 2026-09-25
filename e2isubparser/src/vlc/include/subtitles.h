@@ -70,6 +70,8 @@ typedef struct
     int64_t     i_microsecperframe;
 
     char        *psz_header;
+    /* SAMI: where the next SYNC starts when several are on one line */
+    char        *psz_sami_pos;
     int         i_subtitle;
     int         i_subtitles;
     subtitle_t  *subtitle;

@@ -331,30 +331,47 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
     me->encryption = true;
     me->encryptiontype = enc_type;
 
-    char *link_to_key = malloc(strlen(tag) + strlen(me->url) + 10);
-    char iv_str[STRLEN_BTS(KEYLEN)] = "\0";
-    char sep = '\0';
-    // link_to_key holds more than strlen(tag) bytes, so %[^"] cannot overflow
-    // cppcheck-suppress invalidscanf
-    if ((sscanf(tag, "#EXT-X-KEY:METHOD=AES-128,URI=\"%[^\"]\",IV=0%c%32[0-9a-f]", link_to_key, &sep, iv_str) > 0 ||
-         // cppcheck-suppress invalidscanf
-         sscanf(tag, "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"%[^\"]\",IV=0%c%32[0-9a-f]", link_to_key, &sep, iv_str) > 0))
-    {
-        if (sep == 'x' || sep == 'X')
-        {
-            uint8_t *iv_bin = malloc(KEYLEN);
-            str_to_bin(iv_bin, iv_str, KEYLEN);
-            memcpy(me->enc_aes.iv_value, iv_bin, KEYLEN);
-            me->enc_aes.iv_is_static = true;
-            free(iv_bin);
-        }
-
-        extend_url(&link_to_key, me->url);
-
-        free(me->enc_aes.key_url);
-        me->enc_aes.key_url = strdup(link_to_key);
+    if (enc_type != ENC_AES128 && enc_type != ENC_AES_SAMPLE) {
+        return 0;
     }
-    free(link_to_key);
+
+    /* attributes may come in any order (RFC 8216 4.2), so look for URI and IV
+     * separately instead of one fixed METHOD,URI,IV pattern */
+    const char *uri = strstr(tag, ",URI=\"");
+    if (uri) {
+        uri += 6;
+        const char *uri_end = strchr(uri, '"');
+        if (uri_end) {
+            char *link_to_key = malloc(strlen(tag) + strlen(me->url) + 10);
+            if (!link_to_key) {
+                return 1;
+            }
+            memcpy(link_to_key, uri, uri_end - uri);
+            link_to_key[uri_end - uri] = '\0';
+
+            extend_url(&link_to_key, me->url);
+
+            free(me->enc_aes.key_url);
+            me->enc_aes.key_url = strdup(link_to_key);
+            free(link_to_key);
+        }
+    }
+
+    /* IV=0x... is a hexadecimal-sequence: [0-9A-F], lower case accepted too;
+     * fewer than 32 digits = leading zeros */
+    const char *iv = strstr(tag, ",IV=0");
+    if (iv && (iv[5] == 'x' || iv[5] == 'X')) {
+        const char *hex = iv + 6;
+        size_t digits = strspn(hex, "0123456789abcdefABCDEF");
+        if (digits > 0 && digits <= 2 * KEYLEN) {
+            char iv_str[STRLEN_BTS(KEYLEN)];
+            memset(iv_str, '0', 2 * KEYLEN);
+            memcpy(iv_str + 2 * KEYLEN - digits, hex, digits);
+            iv_str[2 * KEYLEN] = '\0';
+            str_to_bin(me->enc_aes.iv_value, iv_str, KEYLEN);
+            me->enc_aes.iv_is_static = true;
+        }
+    }
     return 0;
 }
 
@@ -1013,14 +1030,14 @@ static int sample_aes_handle_pes_data(hls_media_segment_t *s, ByteBuffer_t *out,
 {
     uint16_t pes_header_size = 0;
     // we need to skip PES header it is not part of NAL unit
-    if (in->pos <= PES_HEADER_SIZE || in->data[0] != 0x00 || in->data[1] != 0x00 || in->data[1] == 0x01) {
+    if (in->pos <= PES_HEADER_SIZE || in->data[0] != 0x00 || in->data[1] != 0x00 || in->data[2] != 0x01) {
         MSG_ERROR("Wrong or missing PES header!\n");
         return -1;
     }
 
     pes_header_size = in->data[8] + 9;
     if (pes_header_size >= in->pos) {
-        MSG_ERROR("Wrong PES header size %hu!\n", &pes_header_size);
+        MSG_ERROR("Wrong PES header size %hu!\n", pes_header_size);
         return -1;
     }
 

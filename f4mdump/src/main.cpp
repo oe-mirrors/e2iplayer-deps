@@ -4,6 +4,7 @@
 #include <string.h> 
 #include <sstream> 
 #include <vector>
+#include <exception>
 
 #include "StringHelper.h"
 #include "ManifestParser.h"
@@ -41,7 +42,7 @@ int main(int argc, char *argv[])
     
     if(1 == argc)
     {
-        printInf("F4MDump v0.80\n");
+        printInf("F4MDump v0.82\n");
         printInf("(c) 2014-2016 samsamsam@o2.pl\n");
         return 0;
     }
@@ -59,15 +60,28 @@ int main(int argc, char *argv[])
     {
         bool bRet = false;
         std::string streamInfo;
-        if(g_UdsDownloader.canHandleUrl(maniUrl))
+        try
         {
-            g_UdsDownloader.initialize(maniUrl, wget);
-            bRet = g_UdsDownloader.reportStreamsInfo(streamInfo);
+            if(g_UdsDownloader.canHandleUrl(maniUrl))
+            {
+                g_UdsDownloader.initialize(maniUrl, wget);
+                bRet = g_UdsDownloader.reportStreamsInfo(streamInfo);
+            }
+            else if(g_F4mDownloader.canHandleUrl(maniUrl))
+            {
+                g_F4mDownloader.initialize(maniUrl, wget);
+                bRet = g_F4mDownloader.reportStreamsInfo(streamInfo);
+            }
         }
-        else if(g_F4mDownloader.canHandleUrl(maniUrl))
+        catch(const char *err)
         {
-            g_F4mDownloader.initialize(maniUrl, wget);
-            bRet = g_F4mDownloader.reportStreamsInfo(streamInfo);
+            printExc("%s\n", err);
+            return -1;
+        }
+        catch(const std::exception &e)
+        {
+            printExc("%s\n", e.what());
+            return -1;
         }
         printInf("%s\n", streamInfo.c_str());
         return bRet ? 0 : -1;
@@ -103,6 +117,11 @@ int main(int argc, char *argv[])
     catch(const char *err)
     {
         printExc("%s\n", err);
+        return -1;
+    }
+    catch(const std::exception &e)
+    {
+        printExc("%s\n", e.what());
         return -1;
     }
     

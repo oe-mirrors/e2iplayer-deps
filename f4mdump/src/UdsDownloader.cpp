@@ -251,7 +251,10 @@ void CUDSDownloader::downloadWithoutTmpFile( const std::string &baseWgetCmd, con
             {
                 // prepare cmd
                 std::stringstream cmd;
-                cmd << baseWgetCmd << " --tries=0 --timeout=" << WGET_TIMEOUT << " -O - " << '"' << StringFormat(downloadUrlBase.c_str(), currentFragment, getFragmentHash(currentFragment).c_str()) << '"';
+                std::string fragUrl = downloadUrlBase;
+                CStringHelper::replace(fragUrl, "_%u_", StringFormat("_%u_", currentFragment));
+                CStringHelper::replace(fragUrl, "_%s.", "_" + getFragmentHash(currentFragment) + ".");
+                cmd << baseWgetCmd << " --tries=0 --timeout=" << WGET_TIMEOUT << " -O - " << ShellQuote(fragUrl);
                 
                 // download fragment
                 uint32_t tries = 0;

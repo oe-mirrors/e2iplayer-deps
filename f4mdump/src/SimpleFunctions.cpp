@@ -127,7 +127,25 @@ size_t replace_fwrite(const void* buff, size_t size, size_t count, FILE* file)
 
 bool IsHttpUrl(const string &url)
 {
-    return CStringHelper::startsWith(url, "http://");
+    return CStringHelper::startsWith(url, "http://") || CStringHelper::startsWith(url, "https://");
+}
+
+string ShellQuote(const string &arg)
+{
+    string out = "'";
+    for(size_t i = 0; i < arg.size(); ++i)
+    {
+        if('\'' == arg[i])
+        {
+            out += "'\\''";
+        }
+        else
+        {
+            out += arg[i];
+        }
+    }
+    out += "'";
+    return out;
 }
 
 void b64decode(const string &str, ByteBuffer_t &buff)

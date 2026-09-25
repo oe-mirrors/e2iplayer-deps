@@ -25,6 +25,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <limits.h>
 
 #include "rtmp_sys.h"
 #include "log.h"
@@ -39,7 +40,7 @@
 #define HMAC_CTX	sha2_context
 #define HMAC_setup(ctx, key, len)	sha2_hmac_starts(&ctx, (unsigned char *)key, len, 0)
 #define HMAC_crunch(ctx, buf, len)	sha2_hmac_update(&ctx, buf, len)
-#define HMAC_finish(ctx, dig, dlen)	dlen = SHA256_DIGEST_LENGTH; sha2_hmac_finish(ctx, dig)
+#define HMAC_finish(ctx, dig, dlen)	dlen = SHA256_DIGEST_LENGTH; sha2_hmac_finish(&ctx, dig)
 #define HMAC_close(ctx)
 #elif defined(USE_GNUTLS)
 #include <nettle/hmac.h>
@@ -48,22 +49,27 @@
 #endif
 #undef HMAC_CTX
 #define HMAC_CTX	struct hmac_sha256_ctx
-#define HMAC_setup(ctx, key, len)	hmac_sha256_set_key(ctx, len, key)
+#define HMAC_setup(ctx, key, len)	hmac_sha256_set_key(&ctx, len, key)
 #define HMAC_crunch(ctx, buf, len)	hmac_sha256_update(&ctx, len, buf)
-#define HMAC_finish(ctx, dig, dlen)	dlen = SHA256_DIGEST_LENGTH; hmac_sha256_digest(ctx, SHA256_DIGEST_LENGTH, dig)
+#define HMAC_finish(ctx, dig, dlen)	dlen = SHA256_DIGEST_LENGTH; hmac_sha256_digest(&ctx, SHA256_DIGEST_LENGTH, dig)
 #define HMAC_close(ctx)
 #else	/* USE_OPENSSL */
 #include <openssl/ssl.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-#ifndef RC4_INT
-#define RC4_INT unsigned int
-#endif
-#endif
 #include <openssl/rc4.h>
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+#define HMAC_CTX HMAC_CTX *
+#define HMAC_setup(ctx, key, len)	ctx = HMAC_CTX_new(); HMAC_Init_ex(ctx, key, len, EVP_sha256(), 0)
+#define HMAC_crunch(ctx, buf, len)	HMAC_Update(ctx, buf, len)
+#define HMAC_finish(ctx, dig, dlen)	HMAC_Final(ctx, dig, &dlen)
+#define HMAC_close(ctx) HMAC_CTX_free(ctx)
+#else
+#define HMAC_setup(ctx, key, len)	HMAC_CTX_init(&ctx); HMAC_Init_ex(&ctx, (unsigned char *)key, len, EVP_sha256(), 0)
 #define HMAC_crunch(ctx, buf, len)	HMAC_Update(&ctx, (unsigned char *)buf, len)
-#define HMAC_finish(ctx, dig, dlen)	HMAC_Final(ctx, (unsigned char *)dig, &dlen);
+#define HMAC_finish(ctx, dig, dlen)	HMAC_Final(&ctx, (unsigned char *)dig, &dlen);
+#define HMAC_close(ctx)	HMAC_CTX_cleanup(&ctx)
+#endif
 #endif
 
 extern void RTMP_TLS_Init();
@@ -72,6 +78,8 @@ extern TLS_CTX RTMP_TLS_ctx;
 #include <zlib.h>
 
 #endif /* CRYPTO */
+
+#define DATELEN	64
 
 #define	AGENT	"Mozilla/5.0"
 
@@ -85,7 +93,8 @@ HTTP_get(struct HTTP_ctx *http, const char *url, HTTP_read_callback *cb)
 #ifdef CRYPTO
   int ssl = 0;
 #endif
-  int hlen, flen = 0;
+  int hlen;
+  long flen = 0;
   int rc, i;
   int len_known;
   HTTPResult ret = HTTPRES_OK;
@@ -244,14 +253,20 @@ HTTP_get(struct HTTP_ctx *http, const char *url, HTTP_read_callback *cb)
 	if (!strncasecmp
 	    (sb.sb_start, "Content-Length: ", sizeof("Content-Length: ") - 1))
 	{
-	  flen = atoi(sb.sb_start + sizeof("Content-Length: ") - 1);
+	  flen = strtol(sb.sb_start + sizeof("Content-Length: ") - 1, NULL, 10);
+	  if (flen < 1 || flen > INT_MAX)
+	  {
+	    ret = HTTPRES_BAD_REQUEST;
+	    goto leave;
+	  }
 	}
       else
 	if (!strncasecmp
 	    (sb.sb_start, "Last-Modified: ", sizeof("Last-Modified: ") - 1))
 	{
 	  *p2 = '\0';
-	  strcpy(http->date, sb.sb_start + sizeof("Last-Modified: ") - 1);
+	  strncpy(http->date, sb.sb_start + sizeof("Last-Modified: ") - 1, DATELEN-1);
+	  http->date[DATELEN-1] = '\0';
 	}
       p2 += 2;
       sb.sb_size -= p2 - sb.sb_start;
@@ -292,7 +307,7 @@ leave:
 struct info
 {
   z_stream *zs;
-  HMAC_CTX *ctx;
+  HMAC_CTX ctx;
   int first;
   int zlib;
   int size;
@@ -456,7 +471,7 @@ RTMP_HashSWF(const char *url, unsigned int *size, unsigned char *hash,
 	     int age)
 {
   FILE *f = NULL;
-  char *path, date[64], cctim[64];
+  char *path, date[DATELEN], cctim[DATELEN];
   long pos = 0;
   time_t ctim = -1, cnow;
   int i, got = 0, ret = 0;
@@ -557,7 +572,8 @@ RTMP_HashSWF(const char *url, unsigned int *size, unsigned char *hash,
 	      else if (!strncmp(buf, "date: ", 6))
 		{
 		  buf[strlen(buf) - 1] = '\0';
-		  strncpy(date, buf + 6, sizeof(date));
+		  strncpy(date, buf + 6, sizeof(date)-1);
+		  date[DATELEN-1] = '\0';
 		  got++;
 		}
 	      else if (!strncmp(buf, "ctim: ", 6))
@@ -585,6 +601,7 @@ RTMP_HashSWF(const char *url, unsigned int *size, unsigned char *hash,
     }
 
   in.first = 1;
+  HMAC_setup(in.ctx, "Genuine Adobe Flash Player 001", 30);
   inflateInit(&zs);
   in.zs = &zs;
 
@@ -650,7 +667,7 @@ RTMP_HashSWF(const char *url, unsigned int *size, unsigned char *hash,
 	  fprintf(f, "\n");
 	}
     }
-
+  HMAC_close(in.ctx);
 out:
   free(path);
   if (f)
