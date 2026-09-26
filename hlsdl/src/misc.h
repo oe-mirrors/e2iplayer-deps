@@ -67,10 +67,12 @@ typedef struct hls_resume_state {
     int      done;    /* media segments already written */
     int64_t  bytes;   /* bytes already in the output file */
     int      map;     /* 1 if the playlist carries an EXT-X-MAP init segment */
-    uint64_t fingerprint;   /* hash of the segment list (url + byte range per
-                               segment, video and audio): a different quality
-                               variant usually has the same segment count, so
-                               this is what actually detects a playlist swap */
+    uint64_t fingerprint;   /* hash of the playlist (variant bandwidth / resolution /
+                               codecs, and per segment the URL path, byte range and
+                               duration, video and audio; scheme, host and query are
+                               left out): a different quality variant usually has the
+                               same segment count, so this is what actually detects a
+                               playlist swap */
 } hls_resume_state_t;
 
 /* Called only when -R is set. done/bytes are 0 for a fresh start (no sidecar,

@@ -207,15 +207,19 @@ jobs:
           cp out.ts.hlsdl.resume saved.resume
           # clear the fault and resume against the same playlist
           chmod 644 "$seg3"
-          timeout 60 ../hlsdl/hlsdl -R -o out.ts rs_full.m3u8
+          timeout 60 ../hlsdl/hlsdl -R -o out.ts rs_full.m3u8 2>resume.log
+          # cmp alone cannot tell a resume from a fresh restart - check it really resumed
+          grep -q '^Resuming: 2/' resume.log || { echo "::error::TS run did not resume: $(tail -n 5 resume.log | tr '\n' '|')"; exit 1; }
           test ! -e out.ts.hlsdl.resume
           cmp ref.ts out.ts
           # "already complete" no-op: the real sidecar bumped to done == total
           cp ref.ts out2.ts
           sed "s/^done .*/done $n/;s/^bytes .*/bytes $(stat -c%s ref.ts)/" saved.resume > out2.ts.hlsdl.resume
-          timeout 30 ../hlsdl/hlsdl -R -o out2.ts rs_full.m3u8
+          timeout 30 ../hlsdl/hlsdl -R -o out2.ts rs_full.m3u8 2>noop.txt
           test ! -e out2.ts.hlsdl.resume
           cmp ref.ts out2.ts
+          # ... and reports the finished size, so a status-only frontend does not see 0
+          grep -q "\"d_s\":$(stat -c%s ref.ts)" noop.txt
           # a sidecar from a different playlist (same segment count) is refused
           ffmpeg -v error -f lavfi -i testsrc=d=5:s=48x32 -c:v mpeg2video \
                  -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
@@ -227,6 +231,72 @@ jobs:
           grep -qi 'does not match' warn.txt
           test ! -e other_out.ts.hlsdl.resume
           cmp other_ref.ts other_out.ts
+      - name: fixture - resume survives per-request query tokens in the segment URLs
+        run: |
+          set -eux
+          cd fx
+          # every failed check leaves its context in an ::error:: annotation
+          fail() { echo "::error::token fixture: $1 :: sidecar=[$(tr '\n' ' ' < tok_out.ts.hlsdl.resume 2>&1)] :: log1=[$(tail -n 5 tok1.log 2>&1 | tr '\n' '|')] :: log2=[$(tail -n 5 tok2.log 2>&1 | tr '\n' '|')]"; exit 1; }
+          (python3 -m http.server 8197 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          # one playlist URL whose content changes between the runs: only the signed
+          # query token on every segment differs (the stored segment URL embeds the
+          # playlist's own path, so the playlist file name has to stay the same)
+          sed 's#\(rs[0-9]*\.ts\)$#\1?token=AAAA#' rs_full.m3u8 > tok.m3u8
+          grep -q 'rs0.ts?token=AAAA' tok.m3u8 || fail "sed did not add the tokens"
+          curl -sf http://127.0.0.1:8197/tok.m3u8 > /dev/null || fail "test server not reachable"
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          # break the 3rd segment (the server answers 404 for an unreadable file)
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../hlsdl/hlsdl -f -R -w 1 -o tok_out.ts http://127.0.0.1:8197/tok.m3u8 2>tok1.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted run did not fail"
+          grep -q '^done 2$' tok_out.ts.hlsdl.resume || fail "no sidecar with done 2 after the interrupted run (rc=$rc)"
+          chmod 644 "$seg3"
+          # second run with different tokens must still resume, not start over
+          sed 's#\(rs[0-9]*\.ts\)$#\1?token=BBBB#' rs_full.m3u8 > tok.m3u8
+          rc=0
+          timeout 60 ../hlsdl/hlsdl -R -o tok_out.ts http://127.0.0.1:8197/tok.m3u8 2>tok2.log || rc=$?
+          [ "$rc" -eq 0 ] || fail "the second run failed (rc=$rc)"
+          grep -q '^Resuming: 2/' tok2.log || fail "the second run did not resume"
+          test ! -e tok_out.ts.hlsdl.resume || fail "sidecar left behind"
+          cmp ref.ts tok_out.ts || fail "output differs from the reference"
+          pkill -f 'http.server 8197' || true
+      - name: fixture - resume is refused when the playlist really changed
+        run: |
+          set -eux
+          cd fx
+          fail() { echo "::error::changed-playlist fixture: $1 :: log=[$(tail -n 5 chg.log 2>&1 | tr '\n' '|')]"; exit 1; }
+          seg3=$(grep '\.ts$' rs_full.m3u8 | sed -n 3p)
+          # (1) same segment URLs, one segment duration different
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../hlsdl/hlsdl -f -R -w 1 -o dur_out.ts rs_full.m3u8 2>chg.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted run did not fail"
+          grep -q '^done 2$' dur_out.ts.hlsdl.resume || fail "no sidecar with done 2"
+          chmod 644 "$seg3"
+          sed '0,/^#EXTINF:[0-9.]*,/s//#EXTINF:7.000000,/' rs_full.m3u8 > rs_dur.m3u8
+          ! cmp -s rs_full.m3u8 rs_dur.m3u8 || fail "sed did not change a duration"
+          timeout 60 ../hlsdl/hlsdl -f -R -o dur_out.ts rs_dur.m3u8 2>chg.log
+          grep -qi 'does not match' chg.log || fail "a changed duration did not refuse the resume"
+          cmp ref.ts dur_out.ts
+          # (2) same segment URLs, a different variant (bandwidth / resolution) picked
+          #     by -b; the master keeps its URL, only its content changes
+          (python3 -m http.server 8197 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 2
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=64x48\nrs_full.m3u8\n' > master.m3u8
+          curl -sf http://127.0.0.1:8197/master.m3u8 > /dev/null || fail "test server not reachable"
+          chmod 000 "$seg3"
+          rc=0
+          timeout 60 ../hlsdl/hlsdl -f -R -b -w 1 -o var_out.ts http://127.0.0.1:8197/master.m3u8 2>chg.log || rc=$?
+          [ "$rc" -ne 0 ] || fail "the interrupted variant run did not fail"
+          grep -q '^done 2$' var_out.ts.hlsdl.resume || fail "no variant sidecar with done 2"
+          chmod 644 "$seg3"
+          printf '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=128x96\nrs_full.m3u8\n' > master.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -R -b -o var_out.ts http://127.0.0.1:8197/master.m3u8 2>chg.log
+          grep -qi 'does not match' chg.log || fail "a different variant did not refuse the resume"
+          cmp ref.ts var_out.ts
+          pkill -f 'http.server 8197' || true
       - name: fixture - interrupted fMP4 (EXT-X-MAP) download resumes
         run: |
           set -eux
@@ -246,7 +316,8 @@ jobs:
           grep -q '^map 1$' rf_out.mp4.hlsdl.resume
           grep -q '^done 2$' rf_out.mp4.hlsdl.resume
           chmod 644 "$seg3"
-          timeout 60 ../hlsdl/hlsdl -R -o rf_out.mp4 rf_full.m3u8
+          timeout 60 ../hlsdl/hlsdl -R -o rf_out.mp4 rf_full.m3u8 2>rf_resume.log
+          grep -q '^Resuming: 2/' rf_resume.log || { echo "::error::fMP4 run did not resume: $(tail -n 5 rf_resume.log | tr '\n' '|')"; exit 1; }
           test ! -e rf_out.mp4.hlsdl.resume
           cmp rf_ref.mp4 rf_out.mp4
           # exactly one ftyp: the init segment was not re-written on resume
@@ -273,7 +344,8 @@ jobs:
           fi
           test -s mav_out.ts.hlsdl.resume
           chmod 644 "$v3"
-          timeout 60 ../hlsdl/hlsdl -R -a ma.m3u8 -o mav_out.ts mv.m3u8
+          timeout 60 ../hlsdl/hlsdl -R -a ma.m3u8 -o mav_out.ts mv.m3u8 2>mav_resume.log
+          grep -q '^Resuming: 2/' mav_resume.log || { echo "::error::-a run did not resume: $(tail -n 5 mav_resume.log | tr '\n' '|')"; exit 1; }
           test ! -e mav_out.ts.hlsdl.resume
           test -s mav_out.ts
           # both streams are still there after the resume splice
