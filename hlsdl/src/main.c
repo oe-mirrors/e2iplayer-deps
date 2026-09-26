@@ -55,10 +55,13 @@ static bool is_file_exists(const char *filename)
 #endif
 }
 
-/* FNV-1a over the media segment list - each segment's URL and byte range,
- * video then audio. Two quality variants of the same VOD almost always have
- * the same segment count, so this is what actually tells a resume run that
- * the playlist it was handed is a different one. */
+/* FNV-1a over what identifies the playlist being downloaded: for the video and
+ * then the audio playlist the selected variant's bandwidth / resolution /
+ * codecs and, per segment, the URL path, byte range and duration. Two quality
+ * variants of the same VOD almost always have the same segment count, so this
+ * is what actually tells a resume run that the playlist it was handed is a
+ * different one. The variant and duration terms keep that true when the URLs
+ * alone cannot tell (they are stripped of scheme, host and query, see below). */
 static uint64_t fnv1a(uint64_t h, const void *data, size_t len)
 {
     const unsigned char *p = data;
@@ -69,6 +72,44 @@ static uint64_t fnv1a(uint64_t h, const void *data, size_t len)
     return h;
 }
 
+static uint64_t fnv1a_str(uint64_t h, const char *s)
+{
+    if (s) {
+        h = fnv1a(h, s, strlen(s));
+    }
+    return fnv1a(h, "\xff", 1);   /* keeps ("ab","c") apart from ("a","bc") */
+}
+
+/* The part of a segment URL that identifies the media: its path. Scheme, host
+ * and everything from '?' / '#' on are left out - CDNs routinely put a
+ * per-request signature or session token in the query string (and may hand out
+ * a different edge hostname each time), so hashing them would make every
+ * resume of the very same stream look like a different playlist. Quality
+ * variants still differ in their path (and, if not, in the variant terms of the
+ * fingerprint). A relative segment URL is stored joined to its playlist's URL,
+ * so the playlist's own path counts too. A token that lives in the path itself
+ * only costs a resume (starting fresh), never a wrong splice. */
+static void url_identity(const char *url, const char **start, size_t *len)
+{
+    const char *p = url;
+    const char *q = url;
+
+    if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')) {
+        while ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')
+               || (*q >= '0' && *q <= '9') || *q == '+' || *q == '-' || *q == '.') {
+            q++;
+        }
+        if (0 == strncmp(q, "://", 3)) {
+            p = strchr(q + 3, '/');
+            if (!p) {
+                p = url + strlen(url);
+            }
+        }
+    }
+    *start = p;
+    *len = strcspn(p, "?#");
+}
+
 static uint64_t playlist_fingerprint(const hls_media_playlist_t *me, const hls_media_playlist_t *audio)
 {
     uint64_t h = 14695981039346656037ULL;   /* FNV-1a 64-bit offset basis */
@@ -77,12 +118,19 @@ static uint64_t playlist_fingerprint(const hls_media_playlist_t *me, const hls_m
         if (!pl) {
             continue;
         }
+        h = fnv1a(h, &pl->bitrate, sizeof(pl->bitrate));
+        h = fnv1a_str(h, pl->resolution);
+        h = fnv1a_str(h, pl->codecs);
         for (const struct hls_media_segment *s = pl->first_media_segment; s; s = s->next) {
             if (s->url) {
-                h = fnv1a(h, s->url, strlen(s->url));
+                const char *id = NULL;
+                size_t idlen = 0;
+                url_identity(s->url, &id, &idlen);
+                h = fnv1a(h, id, idlen);
             }
             h = fnv1a(h, &s->offset, sizeof(s->offset));
             h = fnv1a(h, &s->size, sizeof(s->size));
+            h = fnv1a(h, &s->duration_ms, sizeof(s->duration_ms));
             h = fnv1a(h, &s->is_map, sizeof(s->is_map));
         }
         h ^= 0x9e3779b97f4a7c15ULL;   /* separate the video and audio runs */

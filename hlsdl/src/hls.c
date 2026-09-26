@@ -1855,6 +1855,9 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
 
     if (resume && resume->done >= total_media_segments && total_media_segments > 0) {
         MSG_PRINT("Nothing to resume - the download was already complete.\n");
+        /* a final progress line, so a frontend that only reads the JSON status
+         * sees the finished size instead of the initial "d_s":0 */
+        MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(me->total_duration_ms / 1000), resume->bytes);
         resume_clear(resume->out_filename);
         if (session) {
             clean_http_session(session);
