@@ -1446,6 +1446,64 @@ static int detect_media_type(hls_media_playlist_t *me, const struct ByteBuffer *
     return 0;
 }
 
+/* Some CDNs disguise MPEG-TS segments as images: a small PNG/JPEG/GIF/WEBP
+ * sits in front of the TS data (e.g. live streams whose segments are served
+ * from an image CDN). Written as-is, the output starts with the image and no
+ * player opens it. Only a segment that starts with an image signature AND has
+ * a run of TS packets within the first 64 KB is cut at the first packet -
+ * anything else (plain TS, fMP4, unknown data) is left untouched. The cut runs
+ * on the plaintext: an image in front of AES-128 ciphertext breaks the
+ * decryption before this point and cannot be repaired here. */
+#define DISGUISE_SEARCH_LEN (64 * 1024)
+/* packets in a row that mark the TS start - more than the usual three, since
+ * this cuts real data and image bytes may hold 0x47 by chance */
+#define DISGUISE_PACKET_RUN 5
+
+static void strip_disguise_prefix(struct ByteBuffer *seg)
+{
+    static bool warned = false;
+
+    if (!seg || !seg->data || seg->len < 12 || seg->data[0] == TS_SYNC_BYTE) {
+        return;
+    }
+    const uint8_t *d = seg->data;
+    bool image = !memcmp(d, "\x89PNG\r\n\x1a\n", 8)
+              || (d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF)
+              || !memcmp(d, "GIF8", 4)
+              || (!memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4));
+    if (!image) {
+        return;
+    }
+
+    /* look for the packet run in the head only, image data practically never
+     * holds one */
+    int limit = seg->len;
+    if (limit > DISGUISE_SEARCH_LEN + 3 * TS_PACKET_LENGTH) {
+        limit = DISGUISE_SEARCH_LEN + 3 * TS_PACKET_LENGTH;
+    }
+    struct ByteBuffer head = *seg;
+    head.len = limit;
+    uint8_t *first;
+    while ((first = find_first_ts_packet(&head)) != NULL) {
+        size_t left = (size_t)(seg->len - (first - seg->data));
+        if (consecutive_sync_byte(first, left, DISGUISE_PACKET_RUN)) {
+            break;
+        }
+        head.data = first + 1;
+        head.len = limit - (int)(head.data - seg->data);
+    }
+    if (first == NULL) {
+        return;
+    }
+    int skip = (int)(first - seg->data);
+    memmove(seg->data, first, seg->len - skip);
+    seg->len -= skip;
+    if (!warned) {
+        MSG_WARNING("Segments are disguised as images - cutting %d bytes in front of the MPEG-TS data.\n", skip);
+        warned = true;
+    }
+}
+
 int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
@@ -1625,11 +1683,15 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
             }
 
             /* AES-128 encrypts the whole segment, so the container sniff has to
-             * run on the plaintext. SAMPLE-AES leaves the box/PES headers in the
+             * run on the plaintext. An image head in front of the TS data is cut
+             * off before the sniff. SAMPLE-AES leaves the box/PES headers in the
              * clear - sniff (and reject fMP4) before decrypt_sample_aes touches
              * the buffer. */
             if (me->encryption == true && me->encryptiontype == ENC_AES128) {
                 decrypt_aes128(ms, &seg);
+            }
+            if (!ms->is_map) {
+                strip_disguise_prefix(&seg);
             }
 
             if (0 != detect_media_type(me, &seg)) {
@@ -1741,7 +1803,11 @@ static int vod_download_segment(void **psession, hls_media_playlist_t *me, struc
     if (ret == 0) {
         if (me->encryption == true && me->encryptiontype == ENC_AES128) {
             decrypt_aes128(ms, seg);
-        } else if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
+        }
+        if (!ms->is_map) {
+            strip_disguise_prefix(seg);
+        }
+        if (me->encryption == true && me->encryptiontype == ENC_AES_SAMPLE) {
             decrypt_sample_aes(ms, seg);
         }
     }
