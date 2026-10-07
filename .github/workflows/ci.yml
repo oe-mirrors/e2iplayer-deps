@@ -111,6 +111,47 @@ jobs:
           printf '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nd0.ts\n#EXTINF:1.0,\nd1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nd2.ts\n#EXT-X-ENDLIST\n' > disc.m3u8
           timeout 60 ../hlsdl/hlsdl -f -o out_disc.ts disc.m3u8
           ffprobe -v error -show_entries format=format_name -of csv=p=0 out_disc.ts | grep -q .
+      - name: fixture - TS segments disguised as images (VOD + live)
+        run: |
+          set -eux
+          cd fx
+          ffmpeg -v error -f lavfi -i testsrc=d=3:s=64x48 -c:v mpeg2video \
+                 -f hls -hls_time 1 -hls_list_size 0 -hls_playlist_type vod \
+                 -hls_segment_filename 'img%d.ts' img.m3u8
+          # every segment gets an image in front of the TS data (a WEBP or a
+          # PNG head, alternating) and an image-like name, as on image CDNs
+          for f in $(grep '\.ts$' img.m3u8); do
+            n=${f#img}; n=${n%.ts}
+            if [ $((n % 2)) -eq 0 ]; then
+              printf 'RIFF\042\000\000\000WEBPVP8L\025\000\000\000\057\000\000\000\020\007\020\021\021\210\210\376\007\000' > "dis$n.image"
+            else
+              printf '\211PNG\r\n\032\n\000\000\000\015IHDR\000\000\000\001\000\000\000\001\010\006\000\000\000\037\025\304\211' > "dis$n.image"
+            fi
+            cat "$f" >> "dis$n.image"
+          done
+          sed 's/^img\([0-9]*\)\.ts$/dis\1.image/' img.m3u8 > dis.m3u8
+          cat dis.m3u8
+          # VOD: the image heads are cut off -> the same bytes as the plain TS
+          timeout 60 ../hlsdl/hlsdl -f -o ref_img.ts img.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -o out_dis.ts dis.m3u8 2>dis.log
+          cat dis.log
+          grep -q 'disguised as images' dis.log
+          cmp out_dis.ts ref_img.ts
+          # live: the same cut in the live writer
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' dis.m3u8 > live_dis.m3u8
+          python3 -m http.server 8198 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8198/live_dis.m3u8 && break
+            sleep 0.5
+          done
+          # -s 30: start at the first segment (the window is ~3 s), -i 2 ends
+          # cleanly after 2 s of media instead of waiting for new segments
+          timeout 30 ../hlsdl/hlsdl -f -s 30 -i 2 -e 1 -o out_live_dis.ts "http://127.0.0.1:8198/live_dis.m3u8" || true
+          kill $srv 2>/dev/null || true
+          ls -l out_live_dis.ts
+          test "$(head -c 1 out_live_dis.ts | od -An -tx1 | tr -d ' \n')" = 47
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_live_dis.ts | grep -q video
       - name: fixture - TS video + separate audio playlist (A/V merge)
         run: |
           set -eux

@@ -15,7 +15,7 @@ OE/OpenATV feed recipe.
 
 **Component versions** (bumped by hand alongside each component's own version string)
 
-[![hlsdl](https://img.shields.io/badge/hlsdl-v0.33-blue)](hlsdl/)
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.34-blue)](hlsdl/)
 [![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
 [![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
@@ -75,7 +75,8 @@ Download:       f4mdump "/path/to/wget [extra params]" "http://url.to/Manifest.f
 Downloads VOD and live HLS (`.m3u8`) streams to a single file. Handles
 MPEG-2 Transport Stream and fragmented MP4 / CMAF segments, `EXT-X-MAP`
 initialization segments (fMP4 and TS), `EXT-X-BYTERANGE`, discontinuities,
-and AES-128 / SAMPLE-AES decryption.
+AES-128 / SAMPLE-AES decryption, and TS segments disguised as images (an image
+header in front of the MPEG-TS data is cut off).
 
 Requires `libcurl` and `libcrypto`.
 
