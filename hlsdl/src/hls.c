@@ -90,6 +90,11 @@ static void set_hls_http_header(void *session)
     }
 }
 
+/* set by download_live_hls(): a key request gets one try there - the segment is
+ * skipped on a failure, and the retries (with their timeouts) would hold the
+ * download up until the live window has moved on */
+static bool live_download = false;
+
 /* Never returns NULL: without a session (out of memory, no curl handle) hlsdl
  * cannot go on, and an assert would be compiled out with NDEBUG - so every
  * caller can use the session right away. */
@@ -295,8 +300,11 @@ static bool next_tag_attrib(char **source, char **name, char **value)
 }
 
 /* EXT-X-KEY: the attributes may come in any order (RFC 8216 4.2), METHOD
- * included. An unknown or missing METHOD leaves the key state as it is; a key
- * without URI keeps the previous key URL. */
+ * included. A missing METHOD leaves the key state as it is; a key without URI
+ * keeps the previous key URL. An unknown METHOD (e.g. AES-256-GCM of the HLS
+ * 2nd edition) marks the following segments ENC_UNSUPPORTED: the client must
+ * not decrypt them (draft-pantos-hls-rfc8216bis 6.3.6), and keeping the
+ * previous method would write ciphertext into the output. */
 static int parse_key(hls_media_playlist_t *me, char *attrs)
 {
     char *name = NULL;
@@ -332,6 +340,14 @@ static int parse_key(hls_media_playlist_t *me, char *attrs)
         enc_type = ENC_AES_SAMPLE;
         me->enc_aes.iv_is_static = is_playlist_FPS(me->source);
     } else {
+        static bool warned = false;   /* a live playlist is parsed again on every refresh */
+        if (!warned) {
+            MSG_WARNING("Unsupported EXT-X-KEY METHOD=%s - its segments cannot be decrypted.\n", method);
+            warned = true;
+        }
+        me->encryption = true;
+        me->encryptiontype = ENC_UNSUPPORTED;
+        me->current_encryptiontype = ENC_UNSUPPORTED;
         return 1;
     }
 
@@ -420,6 +436,14 @@ static int parse_tag(hls_media_playlist_t *me, struct hls_media_segment *ms, cha
         ms->duration_ms = get_duration_ms(tag + 8);
     } else if (!strncmp(tag, "#EXT-X-ENDLIST", 14)) {
         me->is_endlist = true;
+    } else if (!strncmp(tag, "#EXT-X-PLAYLIST-TYPE:VOD", 24)) {
+        /* a VOD playlist cannot change (RFC 8216 4.3.3.5) - complete even
+         * without EXT-X-ENDLIST, so it must not be taken for a live window */
+        me->is_endlist = true;
+    } else if (!strncmp(tag, "#EXT-X-GAP", 10)) {
+        /* the segment is missing (HLS 2nd edition): skipped instead of
+         * being fetched and retried until the download gives up */
+        ms->is_gap = true;
     } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY-SEQUENCE:", 30)) {
         sscanf(tag + 30, "%d", &(me->discontinuity_sequence));
     } else if (!strncmp(tag, "#EXT-X-DISCONTINUITY", 20)) {
@@ -462,10 +486,262 @@ static void setup_segment_aes(hls_media_playlist_t *me, hls_media_segment_t *ms,
     }
 }
 
+/* ------------------------------------------------------------------------
+ * EXT-X-DEFINE (HLS 2nd edition): variables, used as {$name} in URI lines and
+ * quoted attribute values. NAME + VALUE defines one; QUERYPARAM="x" takes the
+ * value of query parameter x of the playlist's own URL (a token passed on to
+ * the child URLs); IMPORT="x" (media playlists) takes variable x of the master
+ * playlist. A reference to an unknown variable is left as it is (the request
+ * then fails like any other wrong URL).
+ * ------------------------------------------------------------------------ */
+
+typedef struct hls_var {
+    char *name;
+    char *value;
+    struct hls_var *next;
+} hls_var_t;
+
+/* the master playlist's variables, for IMPORT - one master per run */
+static hls_var_t *master_vars = NULL;
+
+static const char *hls_var_get(const hls_var_t *list, const char *name, size_t len)
+{
+    for (; list; list = list->next) {
+        if (strlen(list->name) == len && !strncmp(list->name, name, len)) {
+            return list->value;
+        }
+    }
+    return NULL;
+}
+
+static void hls_var_set(hls_var_t **list, const char *name, const char *value)
+{
+    hls_var_t *var = calloc(1, sizeof(hls_var_t));
+    if (!var) {
+        return;
+    }
+    var->name = strdup(name);
+    var->value = strdup(value);
+    if (!var->name || !var->value) {
+        free(var->name);
+        free(var->value);
+        free(var);
+        return;
+    }
+    /* in front: a later definition of the same name wins */
+    var->next = *list;
+    *list = var;
+}
+
+static void hls_var_free(hls_var_t *list)
+{
+    while (list) {
+        hls_var_t *next = list->next;
+        free(list->name);
+        free(list->value);
+        free(list);
+        list = next;
+    }
+}
+
+/* raw (still percent-encoded - it goes back into a URL) value of query
+ * parameter name of url, NULL if it has none; malloc'ed */
+static char *url_query_param(const char *url, const char *name)
+{
+    const char *q = url ? strchr(url, '?') : NULL;
+    size_t len = strlen(name);
+    while (q) {
+        q++;
+        size_t pair = strcspn(q, "&#");
+        if (pair > len && q[len] == '=' && !strncmp(q, name, len)) {
+            return strndup(q + len + 1, pair - len - 1);
+        }
+        q = q[pair] == '&' ? q + pair : NULL;
+    }
+    return NULL;
+}
+
+static bool is_var_name_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+}
+
+typedef struct text_buf {
+    char *data;
+    size_t len;
+    size_t cap;
+    bool failed;
+} text_buf_t;
+
+static void text_put(text_buf_t *b, const char *s, size_t n)
+{
+    if (b->failed) {
+        return;
+    }
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->len + n + 1) {
+            cap *= 2;
+        }
+        char *tmp = realloc(b->data, cap);
+        if (!tmp) {
+            b->failed = true;
+            return;
+        }
+        b->data = tmp;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+/* One EXT-X-DEFINE line (without the tag) into vars. */
+static void parse_define(char *attrs, hls_var_t **vars, const char *url, const hls_var_t *imports)
+{
+    static bool warned_query = false;
+    static bool warned_import = false;
+    char *token = NULL;
+    char *value = NULL;
+    char *name = NULL;
+    char *val = NULL;
+    char *queryparam = NULL;
+    char *import = NULL;
+
+    /* VALUE="" is a valid (empty) value, but next_tag_attrib() skips empty
+     * values - looked for in the raw list, before the parse cuts it up */
+    bool empty_value = false;
+    for (const char *p = attrs; (p = strstr(p, "VALUE=\"\"")) != NULL; p++) {
+        if (p == attrs || p[-1] == ',' || p[-1] == ' ') {
+            empty_value = true;
+            break;
+        }
+    }
+
+    while (next_tag_attrib(&attrs, &token, &value)) {
+        if (!strcmp(token, "NAME")) {
+            name = value;
+        } else if (!strcmp(token, "VALUE")) {
+            val = value;
+        } else if (!strcmp(token, "QUERYPARAM")) {
+            queryparam = value;
+        } else if (!strcmp(token, "IMPORT")) {
+            import = value;
+        }
+    }
+    if (name && (val || empty_value)) {
+        hls_var_set(vars, name, val ? val : "");
+    } else if (queryparam) {
+        char *qval = url_query_param(url, queryparam);
+        if (qval) {
+            hls_var_set(vars, queryparam, qval);
+            free(qval);
+        } else if (!warned_query) {   /* a live playlist is parsed again on every refresh */
+            MSG_WARNING("EXT-X-DEFINE: the playlist URL has no query parameter \"%s\".\n", queryparam);
+            warned_query = true;
+        }
+    } else if (import) {
+        const char *ival = hls_var_get(imports, import, strlen(import));
+        if (ival) {
+            hls_var_set(vars, import, ival);
+        } else if (!warned_import) {
+            MSG_WARNING("EXT-X-DEFINE: the master playlist defines no \"%s\" to import.\n", import);
+            warned_import = true;
+        }
+    }
+}
+
+/* The playlist text with its {$name} references replaced, NULL when it has no
+ * EXT-X-DEFINE (nothing to do). url: the playlist's URL (QUERYPARAM); imports:
+ * the master's variables (IMPORT); the variables defined here go to *defined
+ * (may be NULL). A definition only applies to the lines after it. */
+static char *substitute_variables(const char *source, const char *url, const hls_var_t *imports, hls_var_t **defined)
+{
+    if (!source || !strstr(source, "#EXT-X-DEFINE:")) {
+        return NULL;
+    }
+    hls_var_t *vars = NULL;
+    text_buf_t out = {0};
+    const char *line = source;
+
+    while (*line) {
+        size_t len = strcspn(line, "\n");
+        size_t full = len + (line[len] == '\n' ? 1 : 0);
+        if (!strncmp(line, "#EXT-X-DEFINE:", 14)) {
+            char *attrs = strndup(line + 14, len - 14);
+            if (attrs) {
+                /* \r of a CRLF playlist off the last value */
+                size_t alen = strlen(attrs);
+                if (alen && attrs[alen - 1] == '\r') {
+                    attrs[alen - 1] = '\0';
+                }
+                parse_define(attrs, &vars, url, imports);
+                free(attrs);
+            }
+            text_put(&out, line, full);
+        } else {
+            const char *p = line;
+            const char *end = line + full;
+            while (p < end) {
+                const char *ref = NULL;
+                for (const char *s = p; s + 1 < end; s++) {
+                    if (s[0] == '{' && s[1] == '$') {
+                        ref = s;
+                        break;
+                    }
+                }
+                if (!ref) {
+                    text_put(&out, p, (size_t)(end - p));
+                    break;
+                }
+                const char *n = ref + 2;
+                const char *e = n;
+                while (e < end && is_var_name_char(*e)) {
+                    e++;
+                }
+                const char *value = (e < end && *e == '}' && e > n) ? hls_var_get(vars, n, (size_t)(e - n)) : NULL;
+                text_put(&out, p, (size_t)(ref - p));
+                if (value) {
+                    text_put(&out, value, strlen(value));
+                    p = e + 1;
+                } else {
+                    /* unknown: kept as it is */
+                    text_put(&out, ref, 2);
+                    p = ref + 2;
+                }
+            }
+        }
+        line += full;
+    }
+
+    if (defined) {
+        hls_var_free(*defined);
+        *defined = vars;
+    } else {
+        hls_var_free(vars);
+    }
+    if (out.failed) {
+        free(out.data);
+        MSG_ERROR("out of memory\n");
+        return NULL;
+    }
+    return out.data ? out.data : strdup("");
+}
+
 static int media_playlist_get_links(hls_media_playlist_t *me)
 {
     struct hls_media_segment *map = NULL;
     struct hls_media_segment *ms = NULL;
+
+    /* EXT-X-DEFINE: references replaced before anything is parsed (also on
+     * every live refresh); QUERYPARAM reads the URL the playlist was asked
+     * for, IMPORT the master's variables */
+    char *substituted = substitute_variables(me->source, me->orig_url ? me->orig_url : me->url, master_vars, NULL);
+    if (substituted) {
+        free(me->source);
+        me->source = substituted;
+    }
+
     char *src = me->source;
     int64_t seg_offset = 0;
     int64_t seg_size = -1;
@@ -553,8 +829,9 @@ finish:
      * parsed while encryption was still off, so setup_segment_aes() gave it
      * no key and it would be written out undecrypted. Back-fill from the
      * final key state - correct for the common single-key playlist; the
-     * warning covers anything more exotic. */
-    if (me->encryption) {
+     * warning covers anything more exotic. Not for an unsupported METHOD: it
+     * would fail the clear init and the clear segments in front of that key. */
+    if (me->encryption && (me->encryptiontype == ENC_AES128 || me->encryptiontype == ENC_AES_SAMPLE)) {
         struct hls_media_segment *s = me->first_media_segment;
         while (s) {
             if (s->is_map && s->encryptiontype == ENC_NONE && s->enc_aes.key_url == NULL) {
@@ -680,6 +957,15 @@ int handle_hls_master_playlist(struct hls_master_playlist *ma)
     char *token = NULL;
     char *value = NULL;
 
+    /* EXT-X-DEFINE: references replaced first; the master's variables are
+     * kept for IMPORT in its media playlists. QUERYPARAM reads the URL hlsdl
+     * was given. */
+    char *substituted = substitute_variables(ma->source, hls_args.url, NULL, &master_vars);
+    if (substituted) {
+        free(ma->source);
+        ma->source = substituted;
+    }
+
     char *src = ma->source;
     while(*src != '\0'){
         char *end_ptr = strchr(src, '\n');
@@ -693,72 +979,84 @@ int handle_hls_master_playlist(struct hls_master_playlist *ma)
         if (end_ptr > src && end_ptr[-1] == '\r') {
             end_ptr[-1] = '\0';
         }
-        if (*src == '#') {
-            url_expected = false;
-            bitrate = 0;
-            res = NULL;
-            codecs = NULL;
-            audio_grp = NULL;
-
+        if (*src == '\0') {
+            /* a blank line - also one between EXT-X-STREAM-INF and its URI,
+             * which used to become the variant URL (the master's directory)
+             * while the real URI line after it was dropped */
+        } else if (*src == '#') {
+            /* attributes in any order (RFC 8216 4.2); next_tag_attrib() goes
+             * on past an empty value (X="") instead of dropping the rest */
             if (!strncmp(src, "#EXT-X-STREAM-INF:", 18)) {
+                bitrate = 0;
+                res = NULL;
+                codecs = NULL;
+                audio_grp = NULL;
                 src += 18;
-                while (get_next_attrib(&src, &token, &value)) {
-                    if (!strncmp(token, "BANDWIDTH", 9)) {
+                while (next_tag_attrib(&src, &token, &value)) {
+                    if (!strcmp(token, "BANDWIDTH")) {
                         sscanf(value, "%u", &bitrate);
-                    } else if (!strncmp(token, "AUDIO", 5)) {
+                    } else if (!strcmp(token, "AUDIO")) {
                         audio_grp = value;
-                    } else if (!strncmp(token, "RESOLUTION", 10)) {
+                    } else if (!strcmp(token, "RESOLUTION")) {
                         res = value;
-                    } else if (!strncmp(token, "CODECS", 6)) {
+                    } else if (!strcmp(token, "CODECS")) {
                         codecs = value;
                     }
                 }
                 url_expected = true;
-            } else if (!strncmp(src, "#EXT-X-MEDIA:TYPE=AUDIO,", 24)) {
-                src += 24;
+            } else if (!strncmp(src, "#EXT-X-MEDIA:", 13)) {
+                /* TYPE may stand anywhere in the list, not only first */
+                src += 13;
+                char *type = NULL;
                 char *grp_id = NULL;
                 char *name = NULL;
                 char *lang = NULL;
                 char *url = NULL;
                 bool is_default = false;
 
-                while (get_next_attrib(&src, &token, &value)) {
-                    if (!strncmp(token, "GROUP-ID", 8)) {
+                while (next_tag_attrib(&src, &token, &value)) {
+                    if (!strcmp(token, "TYPE")) {
+                        type = value;
+                    } else if (!strcmp(token, "GROUP-ID")) {
                         grp_id = value;
-                    } else if (!strncmp(token, "NAME", 4)) {
+                    } else if (!strcmp(token, "NAME")) {
                         name = value;
-                    } else if (!strncmp(token, "LANGUAGE", 8)) {
+                    } else if (!strcmp(token, "LANGUAGE")) {
                         lang = value;
-                    } else if (!strncmp(token, "URI", 3)) {
+                    } else if (!strcmp(token, "URI")) {
                         url = value;
-                    } else if (!strncmp(token, "DEFAULT", 7)) {
-                        if (!strncmp(value, "YES", 3)) {
-                            is_default = true;
-                        }
+                    } else if (!strcmp(token, "DEFAULT")) {
+                        is_default = !strcmp(value, "YES");
                     }
                 }
 
-                if (grp_id && name && url) {
-                    size_t len = strlen(url);
+                /* A rendition without URI is the audio muxed into the variant
+                 * itself (usually the original language). It is kept with
+                 * url = NULL so that choosing it means "no separate audio" -
+                 * dropping it made hlsdl pick the only rendition with a URI,
+                 * i.e. another language. */
+                if (type && !strcmp(type, "AUDIO") && grp_id && name) {
+                    hls_audio_t *audio = calloc(1, sizeof(hls_audio_t));
+                    if (audio) {
+                        if (url && (audio->url = strdup(url)) != NULL) {
+                            extend_url(&(audio->url), ma->url);
+                        }
+                        audio->grp_id = strdup(grp_id);
+                        audio->name = strdup(name);
+                        audio->lang = lang ? strdup(lang) : NULL;
+                        audio->is_default = is_default;
 
-                    hls_audio_t *audio = malloc(sizeof(hls_audio_t));
-                    memset(audio, 0x00, sizeof(hls_audio_t));
-                    audio->url = malloc(len + 1);
-                    memcpy(audio->url, url, len);
-                    audio->url[len] = '\0';
-                    extend_url(&(audio->url), ma->url);
-
-                    audio->grp_id = strdup(grp_id);
-                    audio->name = strdup(name);
-                    audio->lang = lang ? strdup(lang) : NULL;
-                    audio->is_default = is_default;
-
-                    if (ma->audio) {
-                        audio->next = ma->audio;
+                        /* appended: "the first one" means the first in the playlist */
+                        hls_audio_t **tail = &(ma->audio);
+                        while (*tail) {
+                            tail = &((*tail)->next);
+                        }
+                        *tail = audio;
                     }
-                    ma->audio = audio;
                 }
             }
+            /* any other tag (or comment) leaves a pending variant alone - its
+             * URI line still follows */
         } else if (url_expected) {
             size_t len = strlen(src);
 
@@ -1378,6 +1676,72 @@ static void unlock_media_playlist_mtx(void *mtx)
     pthread_mutex_unlock((pthread_mutex_t *)mtx);
 }
 
+/* The live stream was restarted with lower media sequence numbers (see
+ * hls_playlist_update_thread()). Called with the playlist mutex held, before
+ * the new segments are spliced in: drops what is still queued from the old
+ * stream (those URLs are gone or reused by the new one - fetching them cost up
+ * to -w retries each), lowers me->last_media_sequence so that the splice takes
+ * the new segments from three target durations before the end, and puts the
+ * EXT-X-MAP in force there right in front of them (the splice only takes a map
+ * that directly precedes the first new segment). */
+static void follow_restarted_playlist(hls_media_playlist_t *me, hls_media_playlist_t *new_me)
+{
+    uint64_t target_ms = new_me->target_duration_ms ? new_me->target_duration_ms : me->target_duration_ms;
+    uint64_t duration_ms = 0;
+    struct hls_media_segment *start = NULL;
+    struct hls_media_segment *s;
+
+    for (s = new_me->last_media_segment; s; s = s->prev) {
+        if (s->is_map) {
+            continue;
+        }
+        start = s;
+        duration_ms += s->duration_ms;
+        if (duration_ms >= 3 * target_ms) {
+            break;
+        }
+    }
+    if (!start) {
+        return;
+    }
+    MSG_WARNING("Media sequence went back from %d to %d - following the restarted stream from segment %d.\n",
+                me->last_media_sequence, new_me->last_media_sequence, start->sequence_number);
+
+    struct hls_media_segment *map = start->prev;
+    while (map && !map->is_map) {
+        map = map->prev;
+    }
+    if (map && map != start->prev) {
+        /* unlink it - start comes after it, so map->next is set */
+        if (map->prev) {
+            map->prev->next = map->next;
+        } else {
+            new_me->first_media_segment = map->next;
+        }
+        map->next->prev = map->prev;
+        /* and put it in front of start, whose prev is a media segment */
+        map->prev = start->prev;
+        map->next = start;
+        start->prev->next = map;
+        start->prev = map;
+    }
+    /* the old stream's segments the download has not taken yet */
+    while (me->first_media_segment) {
+        struct hls_media_segment *old = me->first_media_segment;
+        me->first_media_segment = old->next;
+        media_segment_cleanup(old);
+    }
+    me->last_media_segment = NULL;
+
+    /* timestamps start over: the A/V merge works its PMT out again. Every
+     * segment queued from now on carries the new restart count: the live
+     * audio pairing tells the streams apart by it, and a segment of the old
+     * stream that is being fetched right now is not retried any more. */
+    start->discontinuity = true;
+    me->restart_gen++;
+    me->last_media_sequence = start->sequence_number - 1;
+}
+
 static void *hls_playlist_update_thread(void *arg)
 {
 #ifndef _MSC_VER
@@ -1421,6 +1785,13 @@ static void *hls_playlist_update_thread(void *arg)
 
     struct timespec ts;
     memset(&ts, 0x00, sizeof(ts));
+    /* refreshes in a row that failed / that went back in media sequence */
+    int failed_refreshes = 0;
+    int backward_refreshes = 0;
+    /* me->url is where the last refresh was redirected to; when that keeps
+     * failing (an expired token in the redirect target) the original url is
+     * asked again, as on the first request */
+    bool use_orig_url = false;
     MSG_VERBOSE("Update thread started\n");
     while (!is_endlist) {
         // download live hls can interrupt waiting
@@ -1442,10 +1813,25 @@ static void *hls_playlist_update_thread(void *arg)
         memset(&new_me, 0x00, sizeof(new_me));
 
         size_t size = 0;
-        MSG_PRINT("> START DOWNLOAD LIST url[%s]\n", me->url);
-        long http_code = get_data_from_url_with_session(&session, me->url, &new_me.source, &size, STRING, &(new_me.url), -1, -1);
+        char *list_url = (use_orig_url && me->orig_url) ? me->orig_url : me->url;
+        MSG_PRINT("> START DOWNLOAD LIST url[%s]\n", list_url);
+        long http_code = get_data_from_url_with_session(&session, list_url, &new_me.source, &size, STRING, &(new_me.url), -1, -1);
         MSG_PRINT("> END DOWNLOAD LIST\n");
+        /* EXT-X-DEFINE:QUERYPARAM reads the URL the playlist is asked for, not
+         * where a redirect took it (that one may have no query) */
+        new_me.orig_url = strdup(me->orig_url ? me->orig_url : list_url);
         if (200 == http_code && 0 == media_playlist_get_links(&new_me)) {
+            failed_refreshes = 0;
+            if (use_orig_url && new_me.url) {
+                char *url = strdup(new_me.url);
+                if (url) {
+                    pthread_mutex_lock(media_playlist_mtx);
+                    free(me->url);
+                    me->url = url;
+                    pthread_mutex_unlock(media_playlist_mtx);
+                }
+                use_orig_url = false;
+            }
             // no mutex is needed here because download_live_hls not change this fields
             if (new_me.is_endlist ||
                 new_me.first_media_sequence != me->first_media_sequence ||
@@ -1454,9 +1840,33 @@ static void *hls_playlist_update_thread(void *arg)
                 bool list_extended = false;
                 // we need to update list
                 pthread_mutex_lock(media_playlist_mtx);
+                int old_first_media_sequence = me->first_media_sequence;
                 me->is_endlist = new_me.is_endlist;
                 is_endlist = new_me.is_endlist;
                 me->first_media_sequence = new_me.first_media_sequence;
+
+                /* Media sequence numbers went back: either a stale copy from
+                 * another CDN edge (ignored - it has nothing new) or a restart
+                 * of the encoder / restream, after which no number ever gets
+                 * past the old last one and the download would wait forever.
+                 * A restart is taken at once for a clear jump - the new window
+                 * lies below the old one by more than twice its length - and
+                 * otherwise when the numbers stay back for three refreshes in a
+                 * row (a stale edge a little behind must not make the download
+                 * repeat a window); it then goes on from three target
+                 * durations before the new end. */
+                if (new_me.last_media_sequence < me->last_media_sequence) {
+                    int window = new_me.last_media_sequence - new_me.first_media_sequence + 1;
+                    bool clear_jump = new_me.last_media_sequence < old_first_media_sequence
+                                   && old_first_media_sequence - new_me.last_media_sequence > 2 * window;
+                    backward_refreshes++;
+                    if (new_me.last_media_segment && (clear_jump || backward_refreshes >= 3)) {
+                        follow_restarted_playlist(me, &new_me);
+                        backward_refreshes = 0;
+                    }
+                } else {
+                    backward_refreshes = 0;
+                }
 
                 if (new_me.last_media_sequence > me->last_media_sequence)
                 {
@@ -1500,6 +1910,7 @@ static void *hls_playlist_update_thread(void *arg)
 
                             while (ms) {
                                 me->total_duration_ms += ms->duration_ms;
+                                ms->restart_gen = me->restart_gen;
                                 ms = ms->next;
                             }
 
@@ -1519,7 +1930,11 @@ static void *hls_playlist_update_thread(void *arg)
                 pthread_mutex_unlock(media_playlist_mtx);
             }
         } else {
-            MSG_WARNING("Fail to update playlist \"%s\". http_code[%d].\n", me->url, (int)http_code);
+            MSG_WARNING("Fail to update playlist \"%s\". http_code[%d].\n", list_url, (int)http_code);
+            if (++failed_refreshes >= 3 && !use_orig_url && me->orig_url && strcmp(me->orig_url, me->url)) {
+                MSG_WARNING("The playlist keeps failing - asking the original url again.\n");
+                use_orig_url = true;
+            }
             clean_http_session(session);
             sleep(1);
             session = init_hls_session();
@@ -1729,6 +2144,428 @@ static uint8_t *audio_merge_start(ByteBuffer_t *seg)
     return find_first_ts_packet(seg);
 }
 
+/* ------------------------------------------------------------------------
+ * fMP4 / CMAF with a separate audio rendition: one fragmented MP4 file with
+ * both tracks. The HLS spec leaves the output to the client; a player plays
+ * the renditions side by side, kept in sync by their own timestamps. Here the
+ * two init segments become one moov (the video's tracks plus the audio track,
+ * renumbered if its track_ID is taken), and the moof/mdat pairs of both are
+ * written one after the other - every fragment carries its own decode time
+ * (tfdt) and track_ID, so the demuxer puts the samples back in order. The
+ * media data itself is copied untouched.
+ *
+ * Not muxable (the caller reports "fmp4-alt-audio" so the plugin can use
+ * ffmpeg instead): an init without moov/mvex/trex, an audio init with more
+ * than one track, and fragments that give an absolute base data offset
+ * (tfhd base-data-offset-present - it points into the original file).
+ * ------------------------------------------------------------------------ */
+
+/* defined with the VOD download below, also used for the live audio init */
+static int vod_download_segment(void **psession, hls_media_playlist_t *me, struct hls_media_segment *ms, struct ByteBuffer *seg);
+
+static uint32_t rd32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint64_t rd64(const uint8_t *p)
+{
+    return ((uint64_t)rd32(p) << 32) | rd32(p + 4);
+}
+
+static void wr32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static void wr64(uint8_t *p, uint64_t v)
+{
+    wr32(p, (uint32_t)(v >> 32));
+    wr32(p + 4, (uint32_t)v);
+}
+
+/* One ISO-BMFF box: start, total size and header size (8, or 16 with a
+ * 64-bit largesize). */
+typedef struct fmp4_box {
+    uint8_t *data;
+    size_t size;
+    size_t hdr;
+} fmp4_box_t;
+
+/* The next box in [*p, end), false at the end or when it does not fit. */
+static bool fmp4_next_box(uint8_t **p, uint8_t *end, fmp4_box_t *box)
+{
+    size_t left = (size_t)(end - *p);
+    if (left < 8) {
+        return false;
+    }
+    uint64_t size = rd32(*p);
+    size_t hdr = 8;
+    if (size == 1) {
+        if (left < 16) {
+            return false;
+        }
+        size = rd64(*p + 8);
+        hdr = 16;
+    } else if (size == 0) {
+        size = left;   /* up to the end */
+    }
+    if (size < hdr || size > left) {
+        return false;
+    }
+    box->data = *p;
+    box->size = (size_t)size;
+    box->hdr = hdr;
+    *p += size;
+    return true;
+}
+
+static bool fmp4_box_is(const fmp4_box_t *box, const char *type)
+{
+    return !memcmp(box->data + 4, type, 4);
+}
+
+/* first child of the given type, false if there is none */
+static bool fmp4_child(const fmp4_box_t *parent, const char *type, fmp4_box_t *child)
+{
+    uint8_t *p = parent->data + parent->hdr;
+    uint8_t *end = parent->data + parent->size;
+    while (fmp4_next_box(&p, end, child)) {
+        if (fmp4_box_is(child, type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* growing output buffer */
+typedef struct fmp4_buf {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+    bool failed;   /* out of memory */
+} fmp4_buf_t;
+
+static void fmp4_put(fmp4_buf_t *b, const void *data, size_t len)
+{
+    if (b->failed) {
+        return;
+    }
+    if (b->len + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 64 * 1024;
+        while (cap < b->len + len) {
+            cap *= 2;
+        }
+        uint8_t *tmp = realloc(b->data, cap);
+        if (!tmp) {
+            MSG_ERROR("out of memory\n");
+            b->failed = true;
+            return;
+        }
+        b->data = tmp;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+}
+
+/* Starts a box; returns where it starts, for fmp4_close_box(). */
+static size_t fmp4_open_box(fmp4_buf_t *b, const char *type)
+{
+    size_t pos = b->len;
+    uint8_t hdr[8] = {0};
+    memcpy(hdr + 4, type, 4);
+    fmp4_put(b, hdr, sizeof(hdr));
+    return pos;
+}
+
+static void fmp4_close_box(fmp4_buf_t *b, size_t pos)
+{
+    if (!b->failed) {
+        wr32(b->data + pos, (uint32_t)(b->len - pos));
+    }
+}
+
+/* version 1 of a full box (64-bit times); an empty box reads as version 0 -
+ * the size checks after it then fail */
+static bool fmp4_v1(const fmp4_box_t *box)
+{
+    return box->size > box->hdr && box->data[box->hdr] == 1;
+}
+
+/* track_ID of a trak (from its tkhd), 0 if it cannot be read */
+static uint32_t fmp4_trak_id(const fmp4_box_t *trak)
+{
+    fmp4_box_t tkhd;
+    if (!fmp4_child(trak, "tkhd", &tkhd)) {
+        return 0;
+    }
+    size_t off = tkhd.hdr + (fmp4_v1(&tkhd) ? 20 : 12);
+    return tkhd.size >= off + 4 ? rd32(tkhd.data + off) : 0;
+}
+
+/* timescale of a mvhd, 0 if it cannot be read */
+static uint32_t fmp4_mvhd_timescale(const fmp4_box_t *mvhd)
+{
+    size_t off = mvhd->hdr + (fmp4_v1(mvhd) ? 20 : 12);
+    return mvhd->size >= off + 4 ? rd32(mvhd->data + off) : 0;
+}
+
+static uint64_t fmp4_rescale(uint64_t v, uint32_t to, uint32_t from)
+{
+    if (!from || to == from || v > UINT64_MAX / to) {
+        return v;
+    }
+    return (v * to + from / 2) / from;
+}
+
+/* The audio trak, copied into the output, gets its new track_ID, and its
+ * movie-timescale durations (tkhd duration, edit list segment durations) are
+ * converted from the audio init's movie timescale to the video's. */
+static void fmp4_patch_audio_trak(fmp4_box_t *trak, uint32_t new_id, uint32_t to_ts, uint32_t from_ts)
+{
+    fmp4_box_t tkhd;
+    if (fmp4_child(trak, "tkhd", &tkhd)) {
+        bool v1 = fmp4_v1(&tkhd);
+        size_t id_off = tkhd.hdr + (v1 ? 20 : 12);
+        size_t dur_off = tkhd.hdr + (v1 ? 28 : 20);
+        if (tkhd.size >= id_off + 4) {
+            wr32(tkhd.data + id_off, new_id);
+        }
+        if (v1 && tkhd.size >= dur_off + 8) {
+            uint64_t d = rd64(tkhd.data + dur_off);
+            if (d != UINT64_MAX) {
+                wr64(tkhd.data + dur_off, fmp4_rescale(d, to_ts, from_ts));
+            }
+        } else if (!v1 && tkhd.size >= dur_off + 4) {
+            uint32_t d = rd32(tkhd.data + dur_off);
+            if (d != UINT32_MAX) {
+                uint64_t r = fmp4_rescale(d, to_ts, from_ts);
+                wr32(tkhd.data + dur_off, r > UINT32_MAX - 1 ? UINT32_MAX - 1 : (uint32_t)r);
+            }
+        }
+    }
+
+    fmp4_box_t edts, elst;
+    if (fmp4_child(trak, "edts", &edts) && fmp4_child(&edts, "elst", &elst) && elst.size >= elst.hdr + 8) {
+        bool v1 = fmp4_v1(&elst);
+        size_t entry = v1 ? 20 : 12;
+        uint32_t count = rd32(elst.data + elst.hdr + 4);
+        uint8_t *e = elst.data + elst.hdr + 8;
+        for (uint32_t i = 0; i < count && e + entry <= elst.data + elst.size; i++, e += entry) {
+            if (v1) {
+                wr64(e, fmp4_rescale(rd64(e), to_ts, from_ts));
+            } else {
+                uint64_t r = fmp4_rescale(rd32(e), to_ts, from_ts);
+                wr32(e, r > UINT32_MAX ? UINT32_MAX : (uint32_t)r);
+            }
+        }
+    }
+}
+
+typedef struct fmp4_av_mux {
+    uint32_t audio_src_id;   /* track_ID of the audio track in its own init */
+    uint32_t audio_id;       /* ... and in the output */
+} fmp4_av_mux_t;
+
+/* One init (ftyp + moov) from the video and the audio init segment, into out.
+ * 0 on success. */
+static int fmp4_build_av_init(fmp4_av_mux_t *mux, const ByteBuffer_t *vinit, const ByteBuffer_t *ainit, fmp4_buf_t *out)
+{
+    fmp4_box_t box, ftyp = {0}, vmoov = {0}, amoov = {0};
+    uint8_t *p, *end;
+
+    for (p = vinit->data, end = vinit->data + vinit->len; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "ftyp") && !ftyp.data) {
+            ftyp = box;
+        } else if (fmp4_box_is(&box, "moov") && !vmoov.data) {
+            vmoov = box;
+        }
+    }
+    for (p = ainit->data, end = ainit->data + ainit->len; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "moov") && !amoov.data) {
+            amoov = box;
+        }
+    }
+    if (!vmoov.data || !amoov.data) {
+        MSG_ERROR("fMP4 A/V mux: an init segment has no moov.\n");
+        return 1;
+    }
+
+    fmp4_box_t vmvhd, amvhd, vmvex, amvex, atrak = {0};
+    if (!fmp4_child(&vmoov, "mvhd", &vmvhd) || !fmp4_child(&amoov, "mvhd", &amvhd)
+        || !fmp4_child(&vmoov, "mvex", &vmvex) || !fmp4_child(&amoov, "mvex", &amvex)) {
+        MSG_ERROR("fMP4 A/V mux: an init segment has no mvhd / mvex.\n");
+        return 1;
+    }
+
+    /* the audio init: exactly one track, and its trex */
+    int atraks = 0;
+    for (p = amoov.data + amoov.hdr, end = amoov.data + amoov.size; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "trak")) {
+            atrak = box;
+            atraks++;
+        }
+    }
+    mux->audio_src_id = atraks == 1 ? fmp4_trak_id(&atrak) : 0;
+    if (!mux->audio_src_id) {
+        MSG_ERROR("fMP4 A/V mux: the audio init segment has %d tracks.\n", atraks);
+        return 1;
+    }
+    fmp4_box_t atrex = {0};
+    for (p = amvex.data + amvex.hdr, end = amvex.data + amvex.size; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "trex") && box.size >= box.hdr + 8 && rd32(box.data + box.hdr + 4) == mux->audio_src_id) {
+            atrex = box;
+        }
+    }
+    if (!atrex.data) {
+        MSG_ERROR("fMP4 A/V mux: no trex for the audio track.\n");
+        return 1;
+    }
+
+    /* the audio keeps its track_ID unless a video track has it */
+    uint32_t max_video_id = 0;
+    bool id_taken = false;
+    for (p = vmoov.data + vmoov.hdr, end = vmoov.data + vmoov.size; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "trak")) {
+            uint32_t id = fmp4_trak_id(&box);
+            if (id > max_video_id) {
+                max_video_id = id;
+            }
+            id_taken = id_taken || id == mux->audio_src_id;
+        }
+    }
+    mux->audio_id = id_taken ? max_video_id + 1 : mux->audio_src_id;
+    uint32_t next_id = (max_video_id > mux->audio_id ? max_video_id : mux->audio_id) + 1;
+
+    out->len = 0;
+    if (ftyp.data) {
+        fmp4_put(out, ftyp.data, ftyp.size);
+    }
+    size_t moov_pos = fmp4_open_box(out, "moov");
+
+    /* mvhd with the next free track_ID */
+    size_t mvhd_pos = out->len;
+    fmp4_put(out, vmvhd.data, vmvhd.size);
+    size_t next_off = vmvhd.hdr + (fmp4_v1(&vmvhd) ? 108 : 96);
+    if (!out->failed && vmvhd.size >= next_off + 4) {
+        wr32(out->data + mvhd_pos + next_off, next_id);
+    }
+
+    /* the video tracks, then the audio track */
+    for (p = vmoov.data + vmoov.hdr, end = vmoov.data + vmoov.size; fmp4_next_box(&p, end, &box); ) {
+        if (fmp4_box_is(&box, "trak")) {
+            fmp4_put(out, box.data, box.size);
+        }
+    }
+    size_t atrak_pos = out->len;
+    fmp4_put(out, atrak.data, atrak.size);
+    if (!out->failed) {
+        fmp4_box_t copy = {out->data + atrak_pos, atrak.size, atrak.hdr};
+        fmp4_patch_audio_trak(&copy, mux->audio_id, fmp4_mvhd_timescale(&vmvhd), fmp4_mvhd_timescale(&amvhd));
+    }
+
+    /* mvex: the video's (mehd, trex ...) plus the audio trex */
+    size_t mvex_pos = fmp4_open_box(out, "mvex");
+    for (p = vmvex.data + vmvex.hdr, end = vmvex.data + vmvex.size; fmp4_next_box(&p, end, &box); ) {
+        fmp4_put(out, box.data, box.size);
+    }
+    size_t atrex_pos = out->len;
+    fmp4_put(out, atrex.data, atrex.size);
+    if (!out->failed) {
+        wr32(out->data + atrex_pos + atrex.hdr + 4, mux->audio_id);
+    }
+    fmp4_close_box(out, mvex_pos);
+
+    /* the rest of the video moov (udta, meta ...) */
+    for (p = vmoov.data + vmoov.hdr, end = vmoov.data + vmoov.size; fmp4_next_box(&p, end, &box); ) {
+        if (!fmp4_box_is(&box, "mvhd") && !fmp4_box_is(&box, "trak") && !fmp4_box_is(&box, "mvex")) {
+            fmp4_put(out, box.data, box.size);
+        }
+    }
+    fmp4_close_box(out, moov_pos);
+
+    if (out->failed) {
+        return 1;
+    }
+    MSG_VERBOSE("fMP4 A/V mux: audio track %u written as track %u.\n", mux->audio_src_id, mux->audio_id);
+    return 0;
+}
+
+/* Checks one fMP4 segment for the mux and changes the track_ID src_id to
+ * dst_id in its tfhd boxes (src_id 0: no change), in place - the segment is a
+ * buffer of our own, so nothing is copied. -1 when it cannot be muxed, else
+ * the number of fragments. A few bytes after the last box (padding, < 8) are
+ * ignored. */
+static int fmp4_prepare_fragments(ByteBuffer_t *seg, uint32_t src_id, uint32_t dst_id)
+{
+    fmp4_box_t box;
+    uint8_t *p = seg->data;
+    uint8_t *end = seg->data + seg->len;
+    int fragments = 0;
+
+    while (fmp4_next_box(&p, end, &box)) {
+        if (!fmp4_box_is(&box, "moof")) {
+            continue;
+        }
+        fmp4_box_t traf;
+        uint8_t *q = box.data + box.hdr;
+        uint8_t *qend = box.data + box.size;
+        while (fmp4_next_box(&q, qend, &traf)) {
+            fmp4_box_t tfhd;
+            if (!fmp4_box_is(&traf, "traf") || !fmp4_child(&traf, "tfhd", &tfhd) || tfhd.size < tfhd.hdr + 8) {
+                continue;
+            }
+            uint32_t flags = rd32(tfhd.data + tfhd.hdr) & 0xFFFFFF;
+            if (flags & 0x000001) {
+                MSG_ERROR("fMP4 A/V mux: a fragment uses an absolute base data offset.\n");
+                return -1;
+            }
+            if (src_id && rd32(tfhd.data + tfhd.hdr + 4) == src_id) {
+                wr32(tfhd.data + tfhd.hdr + 4, dst_id);
+            }
+        }
+        fragments++;
+    }
+    if (end - p >= 8 || !fragments) {
+        MSG_ERROR("fMP4 A/V mux: a segment is no fMP4 fragment (or cut short).\n");
+        return -1;
+    }
+    return fragments;
+}
+
+/* Writes the moof/mdat boxes of a segment checked by fmp4_prepare_fragments()
+ * straight from it. styp, sidx, prft and emsg are left out - a sidx describes
+ * the original segment, not the muxed file. Bytes written, -1 when the output
+ * took fewer (disk full). */
+static int64_t fmp4_write_fragments(write_ctx_t *out_ctx, const ByteBuffer_t *seg)
+{
+    fmp4_box_t box;
+    uint8_t *p = seg->data;
+    uint8_t *end = seg->data + seg->len;
+    int64_t written = 0;
+
+    while (fmp4_next_box(&p, end, &box)) {
+        if (fmp4_box_is(&box, "moof") || fmp4_box_is(&box, "mdat")) {
+            size_t n = out_ctx->write(box.data, box.size, out_ctx->opaque);
+            written += (int64_t)n;
+            if (n != box.size) {
+                return -1;
+            }
+        }
+    }
+    return written;
+}
+
+static void fmp4_alt_audio_failed(void)
+{
+    MSG_ERROR("fMP4 with a separate audio track cannot be muxed here - use a remuxer (e.g. ffmpeg).\n");
+    MSG_API("{\"error_code\":-1, \"error_msg\":\"fmp4-alt-audio\"}\n");
+}
+
 /* Live audio rendition (EXT-X-MEDIA TYPE=AUDIO, or -a): consecutive audio
  * segments that could not be had before the audio track is given up and the
  * video goes on alone. Waiting for and fetching the audio of one segment
@@ -1752,25 +2589,39 @@ static void unlink_queue_head(hls_media_playlist_t *pl)
 /* Takes the audio segment with media sequence number seq off the audio queue,
  * dropping older ones and audio init segments on the way. NULL when it is
  * already gone or does not show up before the deadline (the playlist refresh
- * is asked for while waiting). Called without the mutex held. */
-static struct hls_media_segment *live_take_audio(hls_media_playlist_t *ma, int seq, pthread_mutex_t *mtx,
-                                                 pthread_cond_t *refresh_cond, pthread_cond_t *empty_cond, time_t deadline)
+ * is asked for while waiting). Stream restarts (media sequence numbers going
+ * back) are told apart by the restart count of the segments, gen being the
+ * video segment's: audio of an earlier stream is dropped (and the refresh
+ * waited for, the audio playlist may notice the restart a little later);
+ * audio already of a later stream, or - for the first video segment of a
+ * stream, first_of_gen - a new audio stream that starts further on, means
+ * there is no audio for seq (*stale set, it is no failing audio track) and
+ * that audio stays queued. While the audio playlist has not followed the
+ * video's restart, only wait_restart waits for that (one deadline), later
+ * calls return *stale at once instead of holding up every video segment.
+ * Called without the mutex held. */
+static struct hls_media_segment *live_take_audio(hls_media_playlist_t *ma, int seq, int gen, bool first_of_gen, bool wait_restart,
+                                                 bool *stale, pthread_mutex_t *mtx, pthread_cond_t *refresh_cond,
+                                                 pthread_cond_t *empty_cond, time_t deadline)
 {
     struct hls_media_segment *found = NULL;
     struct timespec ts;
     memset(&ts, 0x00, sizeof(ts));
     ts.tv_sec = deadline;
+    *stale = false;
 
     pthread_mutex_lock(mtx);
     while (true) {
         struct hls_media_segment *as = ma->first_media_segment;
         if (as) {
-            if (as->is_map || as->sequence_number < seq) {
+            if (as->is_map || as->restart_gen < gen || (as->restart_gen == gen && as->sequence_number < seq)) {
                 unlink_queue_head(ma);
                 media_segment_cleanup(as);
                 continue;
             }
-            if (as->sequence_number == seq) {
+            if (as->restart_gen > gen || (first_of_gen && as->sequence_number > seq)) {
+                *stale = true;
+            } else if (as->sequence_number == seq) {
                 unlink_queue_head(ma);
                 found = as;
             }
@@ -1779,8 +2630,13 @@ static struct hls_media_segment *live_take_audio(hls_media_playlist_t *ma, int s
         if (ma->is_endlist) {
             break;
         }
+        if (ma->restart_gen < gen && !wait_restart) {
+            *stale = true;
+            break;
+        }
         pthread_cond_broadcast(refresh_cond);
         if (ETIMEDOUT == pthread_cond_timedwait(empty_cond, mtx, &ts)) {
+            *stale = ma->restart_gen < gen;
             break;
         }
     }
@@ -1794,6 +2650,11 @@ static struct hls_media_segment *live_take_audio(hls_media_playlist_t *ma, int s
 static int live_fetch_audio(void **psession, struct hls_media_segment *as, struct ByteBuffer *seg, time_t deadline)
 {
     int tries = 0;
+    memset(seg, 0x00, sizeof(*seg));
+    if (as->encryptiontype == ENC_UNSUPPORTED) {
+        MSG_WARNING("Live mode skipping audio segment %d - unsupported encryption.\n", as->sequence_number);
+        return 1;
+    }
     while (true) {
         memset(seg, 0x00, sizeof(*seg));
         size_t size = 0;
@@ -1845,6 +2706,7 @@ static void stop_updater_thread(hls_playlist_updater_params *params, pthread_t t
 int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
+    live_download = true;
 
     if (hls_args.resume) {
         MSG_WARNING("-R (resume) has no effect on a live stream.\n");
@@ -1889,7 +2751,13 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
         if (me->first_media_segment != me->last_media_segment) {
             struct hls_media_segment *ms = me->last_media_segment;
             uint64_t duration_ms = 0;
-            uint64_t duration_offset_ms = hls_args.live_start_offset_sec * 1000;
+            uint64_t duration_offset_ms = (uint64_t)hls_args.live_start_offset_sec * 1000;
+            /* RFC 8216 6.3.3: not closer to the end than three target
+             * durations - a start right at the live edge runs dry at once */
+            if (duration_offset_ms < 3 * me->target_duration_ms) {
+                MSG_VERBOSE("Live start moved back to three target durations (%u s).\n", (unsigned)(3 * me->target_duration_ms / 1000));
+                duration_offset_ms = 3 * me->target_duration_ms;
+            }
             while (ms) {
                 duration_ms += ms->duration_ms;
                 if (duration_ms >= duration_offset_ms) {
@@ -1942,9 +2810,22 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
     pthread_t audio_thread;
     int audio_seq_offset = 0;
     int audio_misses = 0;
+    /* video segments in a row without audio because audio and video are at
+     * different streams after a restart - normal for a segment or two, for
+     * longer only when one playlist alone took a restart (then the audio is
+     * given up like a failing one) */
+    int audio_stale_run = 0;
+    int video_gen_paired = 0;   /* restart count of the last video segment paired with audio */
     int audio_wait_sec = 0;
     void *audio_session = NULL;
     merge_context_t live_merge;
+    /* fMP4 video + audio rendition: one fMP4 with both tracks, see
+     * fmp4_build_av_init() */
+    struct hls_media_segment *audio_map = NULL;
+    fmp4_av_mux_t fmp4_mux = {0};
+    fmp4_buf_t fmp4_buf = {0};
+    bool fmp4_mux_ready = false;   /* the muxed init is written */
+    bool fmp4_warned_map = false;
     memset(&audio_params, 0x00, sizeof(audio_params));
     memset(&live_merge, 0x00, sizeof(live_merge));
     if (audio_on) {
@@ -1960,6 +2841,12 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
             audio_wait_sec = 30;
         }
         live_merge.out = out_ctx;
+        /* the audio init (fMP4): taken off the queue before its refresh
+         * thread runs - live_take_audio() drops init segments */
+        if (me_audio->first_media_segment->is_map) {
+            audio_map = me_audio->first_media_segment;
+            unlink_queue_head(me_audio);
+        }
         audio_params.media_playlist = me_audio;
         audio_params.media_playlist_mtx = (void *)&media_playlist_mtx;
         audio_params.media_playlist_refresh_cond = (void *)&media_playlist_refresh_cond;
@@ -2027,6 +2914,20 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
             merge_reset_pending = true;
         }
 
+        if (ms->is_gap) {
+            MSG_WARNING("Live mode skipping segment %d - it is a gap (EXT-X-GAP).\n", ms->sequence_number);
+            goto loop_cleanup;
+        }
+        if (ms->encryptiontype == ENC_UNSUPPORTED) {
+            /* must not be decrypted nor written as ciphertext - playback fails */
+            MSG_ERROR("Segment %d uses an EXT-X-KEY METHOD hlsdl cannot decrypt.\n", ms->sequence_number);
+            MSG_API("{\"error_code\":-1, \"error_msg\":\"encryption\"}\n");
+            download = false;
+            result = 1;
+            pthread_cancel(thread);
+            goto loop_cleanup;
+        }
+
         int retries = 0;
 
         if (ms->is_map) {
@@ -2047,6 +2948,7 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
             /* an empty body counts as a failed transfer */
             if (!(http_code == 200 || (http_code == 206 && (ms->size > -1 || hls_args.accept_partial_content))) || size == 0) {
                 int first_media_sequence = 0;
+                int restart_gen = 0;
                 if (seg.data) {
                     free(seg.data);
                     seg.data  = NULL;
@@ -2054,11 +2956,16 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
 
                 pthread_mutex_lock(&media_playlist_mtx);
                 first_media_sequence = me->first_media_sequence;
+                restart_gen = me->restart_gen;
                 pthread_mutex_unlock(&media_playlist_mtx);
 
+                /* retried while it is still in the window - the first segment
+                 * of the window is still in it - and its stream was not
+                 * restarted meanwhile (its URL is gone then) */
                 if (http_code != 403 && http_code != 401 && http_code != 410
                         && retries < hls_args.segment_download_retries
-                        && (ms->sequence_number > first_media_sequence || ms->is_map)) {
+                        && ms->restart_gen == restart_gen
+                        && (ms->sequence_number >= first_media_sequence || ms->is_map)) {
                     clean_http_session(session);
                     sleep(1);
                     session = init_hls_session();
@@ -2106,13 +3013,6 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
                 break;
             }
 
-            if (audio_on && me->media_type == MEDIA_TYPE_FMP4) {
-                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
-                audio_on = false;
-                stop_updater_thread(&audio_params, audio_thread);
-                audio_thread_running = false;
-            }
-
             if (ms->encryptiontype == ENC_AES_SAMPLE && 1 == decrypt_sample_aes(ms, &seg)) {
                 MSG_WARNING("Live mode skipping segment %d - it could not be decrypted.\n", ms->sequence_number);
                 free(seg.data);
@@ -2134,15 +3034,81 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
                 break;
             }
 
-            /* the audio of this segment, muxed into its TS packets */
+            /* fMP4 video + fMP4 audio rendition: the video init and the
+             * audio init become one init, and every video segment is
+             * followed by the fragments of its audio segment. Once that init
+             * is written the video stays in this form, also after the audio
+             * track was given up (no raw styp / sidx in the muxed file). */
+            bool fmp4_av = me->media_type == MEDIA_TYPE_FMP4 && (audio_on || fmp4_mux_ready);
+            if (fmp4_av && ms->is_map && fmp4_mux_ready) {
+                /* one moov for the whole file - a new init cannot go in */
+                if (!fmp4_warned_map) {
+                    MSG_WARNING("A new EXT-X-MAP mid-stream is ignored when the audio track is muxed in.\n");
+                    fmp4_warned_map = true;
+                }
+                written_map_set(&written_map, ms, &seg);
+                free(seg.data);
+                break;
+            }
+            if (fmp4_av) {
+                bool fmp4_err = false;
+                fmp4_buf.len = 0;
+                if (ms->is_map) {
+                    /* the audio init is fetched like a live audio segment: a
+                     * few tries within the audio deadline, not the VOD retries */
+                    ByteBuffer_t ainit;
+                    memset(&ainit, 0x00, sizeof(ainit));
+                    fmp4_err = !audio_map
+                            || 0 != live_fetch_audio(&audio_session, audio_map, &ainit, time(NULL) + audio_wait_sec)
+                            || 0 != fmp4_build_av_init(&fmp4_mux, &seg, &ainit, &fmp4_buf);
+                    free(ainit.data);
+                    fmp4_mux_ready = !fmp4_err;
+                } else {
+                    /* no init came first (fMP4 without EXT-X-MAP) - nothing to mux into */
+                    fmp4_err = !fmp4_mux_ready || fmp4_prepare_fragments(&seg, 0, 0) < 0;
+                }
+                if (fmp4_err) {
+                    fmp4_alt_audio_failed();
+                    free(seg.data);
+                    download = false;
+                    result = 1;
+                    pthread_cancel(thread);
+                    break;
+                }
+            }
+
+            /* the audio of this segment, muxed into its TS packets (or
+             * appended as fragments of the audio track, fMP4) */
             size_t merged = 0;
+            struct ByteBuffer seg_audio;     /* fMP4: written after the video */
+            memset(&seg_audio, 0x00, sizeof(seg_audio));
             if (audio_on && !ms->is_map) {
                 time_t audio_deadline = time(NULL) + audio_wait_sec;
+                bool audio_stale = false;
+                /* first video segment of a restarted stream that is not paired
+                 * yet: both playlists numbered anew - once the audio playlist
+                 * has followed the restart too, their offset is worked out
+                 * again like at the start (disjoint windows: live edges lined up) */
+                bool first_of_gen = ms->restart_gen != video_gen_paired;
+                if (first_of_gen) {
+                    pthread_mutex_lock(&media_playlist_mtx);
+                    if (me_audio->restart_gen == ms->restart_gen && me_audio->last_media_sequence >= 0) {
+                        int offset = 0;
+                        if (me->last_media_sequence < me_audio->first_media_sequence
+                            || me_audio->last_media_sequence < me->first_media_sequence) {
+                            offset = me_audio->last_media_sequence - me->last_media_sequence;
+                        }
+                        if (offset != audio_seq_offset) {
+                            MSG_VERBOSE("Audio playlist offset after the restart: %d.\n", offset);
+                            audio_seq_offset = offset;
+                        }
+                    }
+                    pthread_mutex_unlock(&media_playlist_mtx);
+                }
                 struct hls_media_segment *as = live_take_audio(me_audio, ms->sequence_number + audio_seq_offset,
-                                                               &media_playlist_mtx, &media_playlist_refresh_cond,
+                                                               ms->restart_gen, first_of_gen, audio_stale_run == 0,
+                                                               &audio_stale, &media_playlist_mtx, &media_playlist_refresh_cond,
                                                                &media_playlist_empty_cond, audio_deadline);
-                struct ByteBuffer seg_audio;
-                memset(&seg_audio, 0x00, sizeof(seg_audio));
                 /* new PIDs / PMT after a discontinuity (ad break): the merge
                  * works out its PMT again (also when this segment ends up
                  * without audio - the next merge then starts afresh) */
@@ -2150,22 +3116,44 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
                     merge_context_reset(&live_merge);
                     merge_reset_pending = false;
                 }
-                if (as && 0 == live_fetch_audio(&audio_session, as, &seg_audio, audio_deadline)) {
-                    uint8_t *v = find_first_ts_packet(&seg);
-                    uint8_t *a = audio_merge_start(&seg_audio);
-                    if (v && a) {
-                        merged = merge_packets(&live_merge, v, (uint32_t)(seg.len - (v - seg.data)),
-                                               a, (uint32_t)(seg_audio.len - (a - seg_audio.data)));
+                bool audio_gap = as && as->is_gap;
+                if (as && !audio_gap && 0 == live_fetch_audio(&audio_session, as, &seg_audio, audio_deadline)) {
+                    if (fmp4_av) {
+                        if (fmp4_prepare_fragments(&seg_audio, fmp4_mux.audio_src_id, fmp4_mux.audio_id) > 0) {
+                            merged = (size_t)seg_audio.len;   /* kept, written after the video */
+                        } else {
+                            free(seg_audio.data);
+                            memset(&seg_audio, 0x00, sizeof(seg_audio));
+                        }
+                    } else {
+                        uint8_t *v = find_first_ts_packet(&seg);
+                        uint8_t *a = audio_merge_start(&seg_audio);
+                        if (v && a) {
+                            merged = merge_packets(&live_merge, v, (uint32_t)(seg.len - (v - seg.data)),
+                                                   a, (uint32_t)(seg_audio.len - (a - seg_audio.data)));
+                        }
                     }
                 }
-                free(seg_audio.data);
+                if (!fmp4_av) {
+                    free(seg_audio.data);
+                    memset(&seg_audio, 0x00, sizeof(seg_audio));
+                }
                 media_segment_cleanup(as);
 
                 if (merged) {
                     audio_misses = 0;
+                    audio_stale_run = 0;
+                    /* the stream of this video segment has its first pair */
+                    video_gen_paired = ms->restart_gen;
+                } else if (audio_gap) {
+                    /* a declared gap is no failing audio track */
+                    MSG_WARNING("Audio segment of segment %d is a gap (EXT-X-GAP) - writing the video only.\n", ms->sequence_number);
+                } else if (audio_stale && ++audio_stale_run < 3 * LIVE_AUDIO_MAX_MISSES) {
+                    /* audio and video at different streams around a restart - neither */
+                    MSG_WARNING("No audio for segment %d - audio and video are at different streams after a restart.\n", ms->sequence_number);
                 } else {
                     MSG_WARNING("No audio for segment %d - writing the video only.\n", ms->sequence_number);
-                    if (++audio_misses >= LIVE_AUDIO_MAX_MISSES) {
+                    if (audio_stale || ++audio_misses >= LIVE_AUDIO_MAX_MISSES) {
                         MSG_WARNING("The audio track keeps failing - going on with the video only.\n");
                         audio_on = false;
                         stop_updater_thread(&audio_params, audio_thread);
@@ -2174,15 +3162,32 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_
                 }
             }
 
-            /* merge_packets() does not tell a short write apart; a full
-             * disk then shows up with the next video-only write or at close */
-            size_t written = merged ? (size_t)seg.len : out_ctx->write(seg.data, seg.len, out_ctx->opaque);
-            download_size += merged ? merged : written;
-            if (ms->is_map && written == (size_t)seg.len) {
+            bool write_ok;
+            if (fmp4_av && ms->is_map) {
+                /* the muxed init */
+                size_t written = out_ctx->write(fmp4_buf.data, fmp4_buf.len, out_ctx->opaque);
+                download_size += written;
+                write_ok = written == fmp4_buf.len;
+            } else if (fmp4_av) {
+                /* the video fragments, then those of its audio segment,
+                 * straight from the segment buffers */
+                int64_t video_bytes = fmp4_write_fragments(out_ctx, &seg);
+                int64_t audio_bytes = (video_bytes >= 0 && seg_audio.data) ? fmp4_write_fragments(out_ctx, &seg_audio) : 0;
+                download_size += (video_bytes > 0 ? video_bytes : 0) + (audio_bytes > 0 ? audio_bytes : 0);
+                write_ok = video_bytes >= 0 && audio_bytes >= 0;
+            } else {
+                /* merge_packets() does not tell a short write apart; a full
+                 * disk then shows up with the next video-only write or at close */
+                size_t written = merged ? (size_t)seg.len : out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+                download_size += merged ? merged : written;
+                write_ok = written == (size_t)seg.len;
+            }
+            if (ms->is_map && write_ok) {
                 written_map_set(&written_map, ms, &seg);
             }
             free(seg.data);
-            if (written != (size_t)seg.len) {
+            free(seg_audio.data);
+            if (!write_ok) {
                 /* disk full or the reader of stdout went away */
                 MSG_ERROR("Could not write segment %d.\n", ms->sequence_number);
                 download = false;
@@ -2207,6 +3212,8 @@ loop_cleanup:
     }
 
     written_map_free(&written_map);
+    free(fmp4_buf.data);
+    media_segment_cleanup(audio_map);
 
     if (audio_thread_running) {
         stop_updater_thread(&audio_params, audio_thread);
@@ -2248,6 +3255,12 @@ static int vod_download_segment(void **psession, hls_media_playlist_t *me, struc
 {
     int retries = 0;
     int ret = 0;
+    memset(seg, 0x00, sizeof(*seg));
+    if (ms->encryptiontype == ENC_UNSUPPORTED) {
+        MSG_ERROR("Segment %d uses an EXT-X-KEY METHOD hlsdl cannot decrypt.\n", ms->sequence_number);
+        MSG_API("{\"error_code\":-1, \"error_msg\":\"encryption\"}\n");
+        return VOD_SEG_ERROR;
+    }
     while (true) {
         if (ms->is_map) {
             MSG_PRINT("Downloading init segment %s\n", ms->url);
@@ -2403,6 +3416,208 @@ static void resume_checkpoint(hls_resume_state_t *resume, write_ctx_t *out_ctx, 
     resume_save(resume, done, bytes);
 }
 
+/* download_hls_fmp4_av(): the video is not fMP4 - the normal path goes on */
+#define FMP4_AV_NOT_FMP4 (-1)
+
+/* two EXT-X-MAPs with the same source (URL + byte range) */
+static bool same_map_source(const struct hls_media_segment *a, const struct hls_media_segment *b)
+{
+    return a && b && a->url && b->url && !strcmp(a->url, b->url)
+        && a->offset == b->offset && a->size == b->size;
+}
+
+/* the first media segment after ms, NULL if there is none */
+static struct hls_media_segment *next_media_segment(struct hls_media_segment *ms)
+{
+    for (ms = ms ? ms->next : NULL; ms && ms->is_map; ms = ms->next) {
+    }
+    return ms;
+}
+
+/* Writes one fMP4 segment's fragments (track src_id renamed to dst_id)
+ * straight from its buffer. 0 written, 1 error (reported). */
+static int fmp4_write_segment(write_ctx_t *out_ctx, ByteBuffer_t *seg, uint32_t src_id, uint32_t dst_id,
+                              int64_t *download_size)
+{
+    if (fmp4_prepare_fragments(seg, src_id, dst_id) < 0) {
+        fmp4_alt_audio_failed();
+        return 1;
+    }
+    int64_t written = fmp4_write_fragments(out_ctx, seg);
+    if (written < 0) {
+        MSG_ERROR("Could not write to the output file.\n");
+        MSG_API("{\"error_code\":-1, \"error_msg\":\"write\"}\n");
+        return 1;
+    }
+    *download_size += written;
+    return 0;
+}
+
+/* VOD, fMP4 video with a separate fMP4 audio rendition (both start with an
+ * EXT-X-MAP): one fMP4 file with both tracks, see fmp4_build_av_init().
+ * After each video segment comes the audio that starts before the video
+ * segment ends (by the EXTINF timeline), after the last one all the rest - so
+ * a resume after N video segments knows exactly which audio is in the file.
+ * Returns 0 / 1 like download_hls(), or FMP4_AV_NOT_FMP4. */
+static int download_hls_fmp4_av(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio,
+                                hls_resume_state_t *resume, void **psession)
+{
+    struct hls_media_segment *ms = me->first_media_segment;
+    struct hls_media_segment *as = me_audio->first_media_segment;
+    ByteBuffer_t vinit, ainit, seg;
+    fmp4_buf_t buf = {0};
+    fmp4_av_mux_t mux = {0};
+    int ret = 0;
+
+    memset(&ainit, 0x00, sizeof(ainit));
+    if (0 != vod_download_segment(psession, me, ms, &vinit)) {
+        return 1;
+    }
+    if (0 != detect_media_type(me, &vinit)) {
+        free(vinit.data);
+        return 1;
+    }
+    if (me->media_type != MEDIA_TYPE_FMP4) {
+        free(vinit.data);
+        return FMP4_AV_NOT_FMP4;
+    }
+    if (0 != vod_download_segment(psession, me_audio, as, &ainit)) {
+        free(vinit.data);
+        return 1;
+    }
+    if (0 != fmp4_build_av_init(&mux, &vinit, &ainit, &buf)) {
+        fmp4_alt_audio_failed();
+        ret = 1;
+        goto out;
+    }
+
+    bool resuming = resume && resume->done > 0;
+    int64_t download_size = resume ? resume->bytes : 0;
+    if (!resuming && !vod_write(out_ctx, buf.data, (int)buf.len, &download_size)) {
+        ret = 1;
+        goto out;
+    }
+
+    uint64_t video_end_ms = 0;      /* EXTINF timeline: end of the current video segment */
+    uint64_t audio_start_ms = 0;    /* ... start of the next audio segment */
+    uint64_t downloaded_duration_ms = 0;
+    int media_seg_done = 0;
+    int written_segments = 0, skipped_segments = 0, gap_segments = 0, total_media_segments = 0;
+    bool warned_map = false;
+    time_t repTime = 0;
+
+    for (struct hls_media_segment *t = me->first_media_segment; t; t = t->next) {
+        total_media_segments += t->is_map ? 0 : 1;
+    }
+
+    for (ms = ms->next, as = as->next; ms; ms = ms->next) {
+        if (ms->is_map) {
+            /* one moov for the whole file - a new init cannot go in */
+            if (!warned_map && !same_map_source(me->first_media_segment, ms)) {
+                MSG_WARNING("A new EXT-X-MAP mid-stream is ignored when the audio track is muxed in.\n");
+                warned_map = true;
+            }
+            continue;
+        }
+        video_end_ms += ms->duration_ms;
+        bool last = NULL == next_media_segment(ms);
+
+        if (resuming && media_seg_done < resume->done) {
+            /* already in the file, with the audio that goes with it */
+            downloaded_duration_ms += ms->duration_ms;
+            media_seg_done++;
+            while (as && (as->is_map || audio_start_ms < video_end_ms || last)) {
+                audio_start_ms += as->is_map ? 0 : as->duration_ms;
+                as = as->next;
+            }
+            continue;
+        }
+
+        if (ms->is_gap) {
+            MSG_WARNING("Segment %d is a gap (EXT-X-GAP) - skipped.\n", ms->sequence_number);
+            gap_segments++;
+        } else {
+            int seg_ret = vod_download_segment(psession, me, ms, &seg);
+            if (seg_ret == VOD_SEG_DOWNLOAD_ERROR && hls_args.ignore_download_errors) {
+                MSG_WARNING("Skipping segment %d - the output will have a gap.\n", ms->sequence_number);
+                skipped_segments++;
+            } else if (seg_ret) {
+                ret = 1;
+                break;
+            } else {
+                ret = fmp4_write_segment(out_ctx, &seg, 0, 0, &download_size);
+                free(seg.data);
+                if (ret) {
+                    break;
+                }
+                written_segments++;
+            }
+        }
+
+        /* the audio that plays during this video segment */
+        while (as && (as->is_map || audio_start_ms < video_end_ms || last)) {
+            if (as->is_map) {
+                if (!warned_map && !same_map_source(me_audio->first_media_segment, as)) {
+                    MSG_WARNING("A new EXT-X-MAP mid-stream is ignored when the audio track is muxed in.\n");
+                    warned_map = true;
+                }
+                as = as->next;
+                continue;
+            }
+            audio_start_ms += as->duration_ms;
+            if (as->is_gap) {
+                MSG_WARNING("Audio segment %d is a gap (EXT-X-GAP) - skipped.\n", as->sequence_number);
+            } else {
+                int audio_ret = vod_download_segment(psession, me_audio, as, &seg);
+                if (audio_ret == VOD_SEG_DOWNLOAD_ERROR && hls_args.ignore_download_errors) {
+                    MSG_WARNING("Skipping audio segment %d - the output will have a gap.\n", as->sequence_number);
+                } else if (audio_ret) {
+                    ret = 1;
+                    break;
+                } else {
+                    ret = fmp4_write_segment(out_ctx, &seg, mux.audio_src_id, mux.audio_id, &download_size);
+                    free(seg.data);
+                    if (ret) {
+                        break;
+                    }
+                }
+            }
+            as = as->next;
+        }
+        if (ret) {
+            break;
+        }
+
+        downloaded_duration_ms += ms->duration_ms;
+        media_seg_done++;
+        time_t curRepTime = time(NULL);
+        if ((curRepTime - repTime) >= 1) {
+            MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(downloaded_duration_ms / 1000), download_size);
+            repTime = curRepTime;
+        }
+        resume_checkpoint(resume, out_ctx, media_seg_done, download_size);
+    }
+
+    if (ret == 0 && (skipped_segments > 0 || gap_segments > 0)) {
+        if (written_segments == 0) {
+            MSG_ERROR("No media segment could be downloaded.\n");
+            ret = 1;
+        } else {
+            MSG_WARNING("%d of %d segments were skipped - the output has gaps.\n", skipped_segments + gap_segments, total_media_segments);
+        }
+    }
+    if (resume && ret == 0) {
+        resume_clear(resume->out_filename);
+    }
+    MSG_API("{\"t_d\":%u,\"d_d\":%u,\"d_s\":%"PRId64"}\n", (uint32_t)(me->total_duration_ms / 1000), (uint32_t)(downloaded_duration_ms / 1000), download_size);
+
+out:
+    free(vinit.data);
+    free(ainit.data);
+    free(buf.data);
+    return ret;
+}
+
 int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio, hls_resume_state_t *resume)
 {
     MSG_VERBOSE("Downloading segments.\n");
@@ -2430,9 +3645,9 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     struct hls_media_segment *ms = me->first_media_segment;
     struct hls_media_segment *ms_audio = NULL;
     merge_context_t merge_context;
-    bool drop_audio = false;
     bool audio_map_written = (resume && resume->done > 0);
     int skipped_segments = 0;   /* -I */
+    int gap_segments = 0;       /* EXT-X-GAP */
     int written_segments = 0;
     written_map_t written_map = {0};
     /* a discontinuity was crossed since the last A/V merge - kept until the
@@ -2453,6 +3668,16 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         resume_clear(resume->out_filename);
         clean_http_session(session);
         return 0;
+    }
+
+    /* fMP4 video and audio rendition, both with an init segment: muxed into
+     * one fMP4 file with both tracks */
+    if (ms && ms->is_map && ms_audio && ms_audio->is_map) {
+        int fmp4_ret = download_hls_fmp4_av(out_ctx, me, me_audio, resume, &session);
+        if (fmp4_ret != FMP4_AV_NOT_FMP4) {
+            clean_http_session(session);
+            return fmp4_ret;
+        }
     }
 
     /* Fast-forward past the media segments a previous run already wrote,
@@ -2522,25 +3747,26 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
                 ret = 1;
                 break;
             }
-            /* A separate audio rendition cannot be muxed into fMP4 output;
-             * drop its init header. me->media_type is normally known here (the
-             * video EXT-X-MAP is the first list entry), but the guard also
-             * copes with an audio init that somehow arrives first. */
-            if (!drop_audio && me->media_type == MEDIA_TYPE_FMP4) {
-                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
-                drop_audio = true;
+            /* fMP4 video with an audio init lands here only when the mux in
+             * download_hls_fmp4_av() was not possible (no video EXT-X-MAP in
+             * front) - video alone would come out silent */
+            if (me->media_type == MEDIA_TYPE_FMP4) {
+                free(seg_audio.data);
+                fmp4_alt_audio_failed();
+                ret = 1;
+                break;
             }
             /* Only the leading audio init segment may be written raw. A
              * second one mid-stream (re-init after a discontinuity) would
              * land inside the muxed TS and corrupt it. */
-            if (!drop_audio && !audio_map_written) {
+            if (!audio_map_written) {
                 if (!vod_write(out_ctx, seg_audio.data, seg_audio.len, &download_size)) {
                     free(seg_audio.data);
                     ret = 1;
                     break;
                 }
                 audio_map_written = true;
-            } else if (!drop_audio) {
+            } else {
                 MSG_WARNING("Mid-stream audio EXT-X-MAP ignored - re-init after a discontinuity is not handled.\n");
             }
             free(seg_audio.data);
@@ -2550,6 +3776,19 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
 
         if (ms->discontinuity || (ms_audio && ms_audio->discontinuity)) {
             merge_reset_pending = true;
+        }
+        if (ms->is_gap) {
+            /* EXT-X-GAP: nothing to fetch; the paired audio segment goes with
+             * it so the TS merge stays in step (fMP4 does not use that cursor) */
+            MSG_WARNING("Segment %d is a gap (EXT-X-GAP) - skipped.\n", ms->sequence_number);
+            gap_segments++;
+            ms = ms->next;
+            if (ms_audio && me->media_type != MEDIA_TYPE_FMP4) {
+                ms_audio = ms_audio->next;
+            }
+            media_seg_done++;
+            resume_checkpoint(resume, out_ctx, media_seg_done, download_size);
+            continue;
         }
         int seg_ret = vod_download_segment(&session, me, ms, &seg);
         if (0 != seg_ret) {
@@ -2578,12 +3817,16 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
             MSG_WARNING("Crossing EXT-X-DISCONTINUITY at segment %d - output may not be seamless.\n", ms->sequence_number);
         }
 
-        /* Fragmented MP4: concatenate init + media fragments verbatim. A
-         * separate audio rendition cannot be muxed here. */
+        /* Fragmented MP4: concatenate init + media fragments verbatim. With
+         * a separate audio rendition this is reached only when the mux in
+         * download_hls_fmp4_av() was not possible (no init segments) - video
+         * alone would come out silent. */
         if (me->media_type == MEDIA_TYPE_FMP4) {
-            if (ms_audio && !drop_audio) {
-                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
-                drop_audio = true;
+            if (ms_audio) {
+                free(seg.data);
+                fmp4_alt_audio_failed();
+                ret = 1;
+                break;
             }
             bool frag_ok = vod_write(out_ctx, seg.data, seg.len, &download_size);
             free(seg.data);
@@ -2606,7 +3849,11 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
 
         uint8_t *first_video_packet = find_first_ts_packet(&seg);
         uint8_t *first_audio_packet = NULL;
-        if (ms_audio) {
+        memset(&seg_audio, 0x00, sizeof(seg_audio));
+        if (ms_audio && ms_audio->is_gap) {
+            /* the audio of this segment is missing (EXT-X-GAP): video alone */
+            MSG_WARNING("Audio segment %d is a gap (EXT-X-GAP) - writing the video only.\n", ms_audio->sequence_number);
+        } else if (ms_audio) {
             int audio_ret = vod_download_segment(&session, me_audio, ms_audio, &seg_audio);
             if (0 != audio_ret) {
                 free(seg.data);
@@ -2687,13 +3934,13 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
         resume_checkpoint(resume, out_ctx, media_seg_done, download_size);
     }
 
-    if (ret == 0 && skipped_segments > 0) {
+    if (ret == 0 && (skipped_segments > 0 || gap_segments > 0)) {
         if (written_segments == 0) {
             /* -I must not turn "nothing could be fetched" into a success */
             MSG_ERROR("No media segment could be downloaded.\n");
             ret = 1;
         } else {
-            MSG_WARNING("%d of %d segments were skipped - the output has gaps.\n", skipped_segments, total_media_segments);
+            MSG_WARNING("%d of %d segments were skipped - the output has gaps.\n", skipped_segments + gap_segments, total_media_segments);
         }
     }
 
@@ -2713,7 +3960,9 @@ int print_enc_keys(hls_media_playlist_t *me)
 {
     struct hls_media_segment *ms = me->first_media_segment;
     while(ms) {
-        if (ms->encryptiontype != ENC_NONE) {
+        if (ms->encryptiontype == ENC_UNSUPPORTED) {
+            MSG_PRINT("[UNSUPPORTED METHOD] segment %d\n", ms->sequence_number);
+        } else if (ms->encryptiontype != ENC_NONE) {
             fill_key_value(&(ms->enc_aes));
             MSG_PRINT("[AES-128]KEY: 0x");
             for(size_t count = 0; count < KEYLEN; count++) {
@@ -2796,6 +4045,8 @@ void master_playlist_cleanup(struct hls_master_playlist *ma)
  * the audio key pushed each other out and every segment cost a key request.
  * Replaced round robin. Used from the downloading thread only. */
 #define KEY_CACHE_SIZE 8
+/* attempts per key request (VOD; live gets one, see live_download) */
+#define KEY_MAX_TRIES 3
 
 static struct {
     char *url;
@@ -2867,21 +4118,36 @@ int fill_key_value(struct enc_aes128 *es)
                 key_url = es->key_url;
             }
 
-            if (!key_session) {
-                key_session = init_hls_session();
-                set_timeout_session(key_session, 2L, 15L);
+            /* A key server hiccup used to fail a whole VOD download at once
+             * (segments get HLSDL_MAX_RETRIES, the key got none). A refused
+             * key (401/403/410) is not asked for again. */
+            for (int tries = 0; ; tries++) {
+                if (!key_session) {
+                    key_session = init_hls_session();
+                    set_timeout_session(key_session, 2L, 15L);
+                }
+                size = 0;
+                http_code = get_data_from_url_with_session(&key_session, key_url, &key_value, &size, BINKEY, NULL, -1, -1);
+                if (http_code == 200) {
+                    break;
+                }
+                free(key_value);
+                key_value = NULL;
+                /* the next attempt starts on a fresh connection */
+                clean_http_session(key_session);
+                key_session = NULL;
+                if (http_code == 401 || http_code == 403 || http_code == 410 || tries + 1 >= (live_download ? 1 : KEY_MAX_TRIES)) {
+                    break;
+                }
+                MSG_WARNING("Getting key-file [%s] failed http_code[%d] - retrying.\n", es->key_url, (int)http_code);
+                sleep(1);
             }
-            http_code = get_data_from_url_with_session(&key_session, key_url, &key_value, &size, BINKEY, NULL, -1, -1);
             if (es->key_url != key_url) {
                 free(key_url);
             }
 
             if (http_code != 200) {
                 MSG_ERROR("Getting key-file [%s] failed http_code[%d].\n", es->key_url, (int)http_code);
-                free(key_value);
-                /* the next attempt starts on a fresh connection */
-                clean_http_session(key_session);
-                key_session = NULL;
                 return 1;
             }
 

@@ -13,6 +13,9 @@ extern "C" {
 #define MASTER_PLAYLIST 0
 #define MEDIA_PLAYLIST 1
 
+/* an EXT-X-KEY METHOD hlsdl does not know (e.g. AES-256-GCM, HLS 2nd edition):
+ * such segments must not be "decrypted" nor written as they are */
+#define ENC_UNSUPPORTED 0x04
 #define ENC_AES_SAMPLE_CTR 0x03
 #define ENC_AES_SAMPLE 0x02
 #define ENC_AES128 0x01
@@ -45,6 +48,8 @@ typedef struct hls_media_segment {
     int sequence_number;
     bool is_map;
     bool discontinuity;   /* an EXT-X-DISCONTINUITY precedes this segment */
+    bool is_gap;          /* EXT-X-GAP: the segment is missing - never fetched */
+    int restart_gen;      /* stream restarts (media sequence went back) of its playlist when it was queued */
     int encryptiontype;   /* ENC_* of the EXT-X-KEY in force for this segment */
     uint64_t duration_ms;
     struct enc_aes128 enc_aes;
@@ -70,6 +75,7 @@ typedef struct hls_media_playlist {
     int discontinuity_sequence;    /* EXT-X-DISCONTINUITY-SEQUENCE */
     int first_media_sequence;
     int last_media_sequence;
+    int restart_gen;               /* live: stream restarts followed so far */
     struct hls_media_segment *first_media_segment;
     struct hls_media_segment *last_media_segment;
     struct enc_aes128 enc_aes;
@@ -78,7 +84,7 @@ typedef struct hls_media_playlist {
 } hls_media_playlist_t;
 
 typedef struct hls_audio {
-    char *url;
+    char *url;            /* NULL: the rendition is muxed into the variant itself */
     char *grp_id;
     char *lang;
     char *name;
