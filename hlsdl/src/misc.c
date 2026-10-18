@@ -22,13 +22,13 @@ struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.36\n");
+    printf("hlsdl v0.37\n");
     printf("(c) 2017-2026 @selsta, samsamsam@o2.pl\n");
     printf("Usage: %s [options] url\n\n"
-           "-b ... Automatically choose the best quality.\n"
+           "-b ... Automatically choose the best quality (AV1 / Dolby Vision only when there is nothing else).\n"
            "-W ... Choose largest width lower or equal than this.\n"
            "-H ... Choose largest height lower or equal than this.\n"
-           "-A ... Select audio language.\n"
+           "-A ... Select audio language (else the DEFAULT rendition, else the first).\n"
            "-v ... Verbose more information.\n"
            "-o ... Choose name of output file (\"-\" alias for stdout).\n"
            "-u ... Set custom HTTP User-Agent header.\n"
@@ -43,13 +43,13 @@ static void print_help(const char *filename)
            "-q ... Print less to the console (status lines, errors and warnings; -qq: nothing).\n"
            "-d ... Print the openssl decryption command.\n"
            "-t ... Print the links to the .ts files.\n"
-           "-s ... Set live start offset in seconds.\n"
+           "-s ... Set live start offset in seconds (at least three target durations).\n"
            "-i ... Set live stream download duration in seconds.\n"
            "-e ... Set refresh delay in seconds.\n"
            "-r ... Set max retries at open.\n"
            "-w ... Set max download segment retries.\n"
            "-I ... Skip VOD segments that still fail after the retries (the output has gaps; not with -R).\n"
-           "-a ... Set additional url to the audio media playlist (VOD and live, TS only).\n"
+           "-a ... Set additional url to the audio media playlist (VOD and live; TS, or fMP4 with init segments).\n"
            "-c ... Treat HTTP code 206 as 200 even if request was made without range header.\n"
            "-C ... the file name of file holding cookie data in the old Netscape / Mozilla cookie data format.\n", filename);
     exit(0);

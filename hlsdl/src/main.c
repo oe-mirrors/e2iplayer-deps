@@ -35,7 +35,111 @@ char* str_ecryption_type[] ={
     "AES-128",
     "SAMPLE-AES",
     "SAMPLE-AES-CTR",
+    "UNSUPPORTED",
 };
+
+/* false for a variant set-top boxes cannot decode: AV1 and Dolby Vision
+ * (in CODECS). HEVC is left in - most receivers decode it. */
+static bool variant_decodable(const hls_media_playlist_t *me)
+{
+    static const char *undecodable[] = {"av01", "dvh1", "dvhe", "dva1", "dvav"};
+    char codecs[256];
+    size_t i;
+
+    if (!me->codecs) {
+        return true;
+    }
+    for (i = 0; i + 1 < sizeof(codecs) && me->codecs[i]; i++) {
+        char c = me->codecs[i];
+        codecs[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    codecs[i] = '\0';
+    for (i = 0; i < sizeof(undecodable) / sizeof(undecodable[0]); i++) {
+        if (strstr(codecs, undecodable[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* LANGUAGE of a rendition against -A, case-insensitive (BCP 47 tags):
+ * "de" also takes "de-DE" / "DE" */
+static bool lang_matches(const char *lang, const char *wanted)
+{
+    if (!lang || !wanted) {
+        return false;
+    }
+    while (*lang && *wanted) {
+        char a = *lang++, b = *wanted++;
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) {
+            return false;
+        }
+    }
+    return *wanted == '\0' && (*lang == '\0' || *lang == '-');
+}
+
+/* The AUDIO rendition of group grp_id to use. Without a terminal to ask
+ * (-b, -A, -W or -H given) it is never asked for: the -A language, else the
+ * DEFAULT=YES one, else the first one. Asking used to block on stdin when the
+ * group had no DEFAULT rendition. A rendition with url == NULL is the audio
+ * inside the variant itself. NULL when the group is unknown. */
+static hls_audio_t *select_audio_rendition(hls_audio_t *list, const char *grp_id)
+{
+    hls_audio_t *audio;
+    hls_audio_t *first = NULL;
+    hls_audio_t *def = NULL;
+    hls_audio_t *by_lang = NULL;
+    int count = 0;
+
+    for (audio = list; audio; audio = audio->next) {
+        if (strcmp(audio->grp_id, grp_id)) {
+            continue;
+        }
+        count++;
+        if (!first) {
+            first = audio;
+        }
+        if (!def && audio->is_default) {
+            def = audio;
+        }
+        if (!by_lang && hls_args.audiolang && lang_matches(audio->lang, hls_args.audiolang)) {
+            by_lang = audio;
+        }
+    }
+    if (count <= 1) {
+        return first;
+    }
+    if (by_lang) {
+        return by_lang;
+    }
+    if (hls_args.use_best || hls_args.audiolang || hls_args.maxwidth > -1 || hls_args.maxheight > -1) {
+        return def ? def : first;
+    }
+
+    int i = 0;
+    int audio_choice = -1;
+    for (audio = list; audio; audio = audio->next) {
+        if (!strcmp(audio->grp_id, grp_id)) {
+            MSG_PRINT("%d: Name: %s, Language: %s%s\n", i, audio->name, audio->lang ? audio->lang : "unknown",
+                      audio->url ? "" : " (in the video stream)");
+            i += 1;
+        }
+    }
+    MSG_PRINT("Which Language should be downloaded? ");
+    if (scanf("%d", &audio_choice) != 1 || audio_choice < 0 || audio_choice >= i) {
+        MSG_ERROR("Wrong input!\n");
+        exit(1);
+    }
+    i = 0;
+    for (audio = list; audio; audio = audio->next) {
+        if (!strcmp(audio->grp_id, grp_id) && i++ == audio_choice) {
+            return audio;
+        }
+    }
+    return NULL;
+}
 
 
 static size_t priv_write(const uint8_t *data, size_t len, void *opaque) {
@@ -287,22 +391,35 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        /* AV1 / Dolby Vision variants are only picked when there is nothing else */
+        bool skip_undecodable = false;
+        for (hls_media_playlist_t *me = master_playlist.media_playlist; me; me = me->next) {
+            if (variant_decodable(me)) {
+                skip_undecodable = true;
+                break;
+            }
+        }
+
         hls_media_playlist_t *selected = NULL;
         if (hls_args.use_best) {
-            selected = master_playlist.media_playlist;
-            hls_media_playlist_t *me = selected->next;
-            while (me) {
-                if (me->bitrate > selected->bitrate) {
+            for (hls_media_playlist_t *me = master_playlist.media_playlist; me; me = me->next) {
+                if (skip_undecodable && !variant_decodable(me)) {
+                    continue;
+                }
+                if (!selected || me->bitrate > selected->bitrate) {
                     selected = me;
                 }
-                me = me->next;
             }
-            MSG_VERBOSE("Choosing best quality. (Bitrate: %d), (Resolution: %s), (Codecs: %s)\n", selected->bitrate, selected->resolution, selected->codecs);
+            if (selected) {
+                MSG_VERBOSE("Choosing best quality. (Bitrate: %d), (Resolution: %s), (Codecs: %s)\n", selected->bitrate, selected->resolution, selected->codecs);
+            }
         } else if (hls_args.maxwidth > -1 || hls_args.maxheight > -1) {
             int width, maxwidth = 0;
             int height, maxheight = 0;
             hls_media_playlist_t *me;
             for (me = master_playlist.media_playlist; me; me = me->next) {
+                if (skip_undecodable && !variant_decodable(me))
+                    continue;
                 /* a variant without RESOLUTION must not end the search */
                 if (sscanf(me->resolution, "%dx%d", &width, &height) < 2)
                     continue;
@@ -357,89 +474,12 @@ int main(int argc, char *argv[])
         }
 
         if (selected->audio_grp) {
-            // check if have valid group
-            hls_audio_t *selected_audio = NULL;
-            hls_audio_t *audio = master_playlist.audio;
-            bool has_audio_playlist = false;
-
-            while (audio) {
-                if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                    if (has_audio_playlist) {
-                        selected_audio = NULL; // more then one audio playlist, so selection is needed
-                        break;
-                    } else {
-                        has_audio_playlist = true;
-                        selected_audio = audio;
-                    }
-                }
-                audio = audio->next;
-            }
-
-            if (has_audio_playlist) {
-                // print hls master playlist
-                /* -1 = nothing picked yet; 0 is a valid index (the first
-                 * entry) */
-                int audio_choice = -1;
-                int i = 1;
-
-                if (!selected_audio) {
-                    if (hls_args.use_best || hls_args.audiolang) {
-                        i = 0;
-                        audio = master_playlist.audio;
-                        while (audio) {
-                            if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                                if (hls_args.use_best && audio->is_default) {
-                                    audio_choice = i;
-                                    break;
-                                }
-                                if (hls_args.audiolang && audio->lang && 0 == strcmp(audio->lang, hls_args.audiolang)) {
-                                    audio_choice = i;
-                                    break;
-                                }
-                            }
-                            i += 1;
-                            audio = audio->next;
-                        }
-                    }
-
-                    if (audio_choice < 0) {
-                        audio = master_playlist.audio;
-                        i = 0;
-                        while (audio) {
-                            if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                                MSG_PRINT("%d: Name: %s, Language: %s\n", i, audio->name, audio->lang ? audio->lang : "unknown");
-                            }
-                            i += 1;
-                            audio = audio->next;
-                        }
-
-                        MSG_PRINT("Which Language should be downloaded? ");
-                        if (scanf("%d", &audio_choice) != 1 || audio_choice < 0 || audio_choice >= i) {
-                            MSG_ERROR("Wrong input!\n");
-                            exit(1);
-                        }
-                    }
-
-                    i = 0;
-                    audio = master_playlist.audio;
-                    while (audio) {
-                        if (0 == strcmp(audio->grp_id, selected->audio_grp)) {
-                            if (i == audio_choice) {
-                                selected_audio = audio;
-                                break;
-                            }
-                        }
-                        i += 1;
-                        audio = audio->next;
-                    }
-
-                    if (!selected_audio) {
-                        MSG_ERROR("Wrong selection!\n");
-                        exit(1);
-                    }
-                }
-
+            hls_audio_t *selected_audio = select_audio_rendition(master_playlist.audio, selected->audio_grp);
+            if (selected_audio && selected_audio->url) {
+                MSG_VERBOSE("Audio rendition \"%s\" (%s).\n", selected_audio->name, selected_audio->lang ? selected_audio->lang : "unknown");
                 audio_media_playlist.orig_url = strdup(selected_audio->url);
+            } else if (selected_audio) {
+                MSG_VERBOSE("Audio rendition \"%s\" is part of the variant - no separate audio playlist.\n", selected_audio->name);
             }
         }
 
