@@ -29,7 +29,7 @@ jobs:
 
       - name: Install build deps
         if: steps.gate.outputs.run == 'true'
-        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev python3-dev
+        run: sudo apt-get update && sudo apt-get -y install libcurl4-openssl-dev libssl-dev libpng-dev python3-dev
 
       - name: Install SonarCloud build wrapper
         if: steps.gate.outputs.run == 'true'
@@ -42,6 +42,8 @@ jobs:
             make -C hlsdl &&
             make -C cmdwrap &&
             make -C lsdir &&
+            make -C e2ipow &&
+            make -C exteplayer3png &&
             make -C e2isubparser CFLAGS="-w"
           '
 
