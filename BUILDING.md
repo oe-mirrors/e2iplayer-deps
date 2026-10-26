@@ -9,6 +9,8 @@ Makefiles work for a native build and for an OpenEmbedded cross build.
 make -C hlsdl
 make -C cmdwrap
 make -C lsdir
+make -C e2ipow
+make -C exteplayer3png          # needs the libpng headers
 make -C e2isubparser            # needs python3 dev headers
 
 # cross (OE)
@@ -18,6 +20,7 @@ make -C e2isubparser CC="${CC}" CFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}" \
 ```
 
 Outputs: `hlsdl/hlsdl`, `cmdwrap/cmdwrap`, `lsdir/lsdir`,
+`e2ipow/e2ipow`, `exteplayer3png/exteplayer3png.so`,
 `e2isubparser/_subparser.so`.
 
 The old `make.sh` / `doall.sh` scripts were hard-coded to one developer's

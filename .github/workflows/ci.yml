@@ -1444,8 +1444,10 @@ jobs:
           check hlsdl        "$(grep -oE 'hlsdl v[0-9.]+' hlsdl/src/misc.c | head -1 | sed 's/hlsdl //')"
           check e2isubparser "$(grep -oE '"[0-9]+\.[0-9]+"' e2isubparser/src/subparsermodule.c | head -1 | tr -d '"')"
           check lsdir        "$(grep -oE '"[0-9.]+"' lsdir/src/lsdir.c | head -1 | tr -d '"')"
-          check cmdwrap      "$(grep -oE 'Version: [0-9]+' cmdwrap/src/cmdwrap.c | grep -oE '[0-9]+')"
+          check cmdwrap      "$(grep -oE 'Version: [0-9.]+' cmdwrap/src/cmdwrap.c | grep -oE '[0-9.]+')"
           check f4mdump      "$(grep -oE 'F4MDump v[0-9.]+' f4mdump/src/main.cpp | sed 's/F4MDump //')"
+          check e2ipow       "$(grep -oE 'E2IPOW_VERSION "[0-9.]+"' e2ipow/src/e2ipow.c | grep -oE '[0-9.]+')"
+          check exteplayer3png "$(grep -oE 'EXTEPLAYER3PNG_VERSION "[0-9.]+"' exteplayer3png/src/png.c | grep -oE '[0-9.]+')"
 
   # --------------------------------------------------------------- cppcheck
   # Static analysis of the C we maintain (not the vendored expat / vlc /
@@ -1461,7 +1463,7 @@ jobs:
         run: |
           cppcheck --enable=warning,portability --inline-suppr --std=c11 \
                    --suppress=missingIncludeSystem --suppress=missingInclude \
-                   hlsdl/src cmdwrap/src lsdir/src
+                   hlsdl/src cmdwrap/src lsdir/src e2ipow/src exteplayer3png/src
 
   # ---------------------------------------------------------------- f4mdump
   # f4mdump has no build file in the repo: build it from the same sources and
@@ -1515,3 +1517,122 @@ jobs:
           out=$(./f4mdump "wget -q" "http://127.0.0.1:8765/manifest.f4m" 2>&1)
           echo "$out"
           echo "$out" | grep -qF '"qualities":[500, 1500]'
+
+  # ----------------------------------------------------------------- e2ipow
+  # Built like the OE recipe (S7). The expected byse results come from
+  # E2iPlayer's scripts/bysepow.py (the Python solver the binary replaces):
+  # same first solution and the same number of tried hashes.
+  e2ipow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: build (recipe flags)
+        working-directory: e2ipow
+        run: |
+          set -eux
+          gcc src/e2ipow.c -O2 -Wall -Wextra -Werror -o e2ipow
+          ./e2ipow --version | grep -qE '^e2ipow [0-9]'
+          ./e2ipow --list | grep -qx byse
+          make
+      - name: byse results match scripts/bysepow.py
+        working-directory: e2ipow
+        run: |
+          set -eu
+          check() {
+            out=$(./e2ipow byse "$1" "$2" "$3" "$4" 60)
+            echo "$* -> $out"
+            test "$out" = "$5" || { echo "::error::e2ipow byse $1 $2 $3 $4: got $out, expected $5"; exit 1; }
+          }
+          check e2iplayer-ci-0123456789abcdef 8 0 1 '{"solution": "59", "hashes": 60}'
+          check e2iplayer-ci-0123456789abcdef 10 2 3 '{"solution": "59", "hashes": 20}'
+          check 3f9c1a7be05d4e21 12 0 1 '{"solution": "8380", "hashes": 8381}'
+          check 3f9c1a7be05d4e21 12 1 2 '{"solution": "15201", "hashes": 7601}'
+          check x 0 0 1 '{"solution": "0", "hashes": 0}'
+      - name: time limit, bad arguments, unknown algorithm
+        working-directory: e2ipow
+        run: |
+          set -eu
+          rc=0; ./e2ipow byse abc 64 0 1 1 > out.txt || rc=$?
+          cat out.txt
+          test $rc -eq 3
+          grep -qF '"solution": null' out.txt
+          rc=0; ./e2ipow byse abc 8 -1 1 5 || rc=$?; test $rc -eq 2
+          rc=0; ./e2ipow byse abc 8 0 1 || rc=$?; test $rc -eq 2
+          rc=0; ./e2ipow nosuch abc 8 0 1 5 || rc=$?; test $rc -eq 2
+          rc=0; ./e2ipow || rc=$?; test $rc -eq 2
+          time ./e2ipow byse 3f9c1a7be05d4e21 16 0 1 60
+
+  # ---------------------------------------------------------- exteplayer3png
+  # Built like the OE recipe (S8), then loaded the way exteplayer3 does it:
+  # dlopen("exteplayer3png.so") + dlsym("SaveRGBAImage").
+  exteplayer3png:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: install build deps
+        run: sudo apt-get update && sudo apt-get -y install libpng-dev python3-pil
+      - name: build (recipe flags)
+        working-directory: exteplayer3png
+        run: |
+          set -eux
+          gcc src/png.c -shared -fPIC -O2 -Wall -Wextra -Wno-clobbered -Werror -Wl,-z,defs -lpng -o exteplayer3png.so
+          nm -D --defined-only exteplayer3png.so | grep -qw SaveRGBAImage
+          make clean && make
+      - name: write a PNG through dlopen
+        working-directory: exteplayer3png
+        run: |
+          set -eux
+          cat > loader.c <<'CEOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          int main(void)
+          {
+              int (*save)(const char *, const unsigned char *, int, int);
+              unsigned char px[2 * 3 * 4];
+              unsigned char *sub;
+              int i, y, w = 1920, hh = 200;
+              clock_t t;
+              void *h = dlopen("exteplayer3png.so", RTLD_LAZY);
+              if (!h) { fprintf(stderr, "%s\n", dlerror()); return 1; }
+              *(void **)(&save) = dlsym(h, "SaveRGBAImage");
+              if (!save) return 1;
+              for (i = 0; i < (int)sizeof(px); i++) px[i] = (unsigned char)(i * 10);
+              if (save("out.png", px, 3, 2) != 0) return 2;
+              if (save("/nonexistent/dir/x.png", px, 3, 2) != -1) return 3;
+              if (save("bad.png", px, 0, 2) != -1) return 4;
+              if (save("bad.png", px, 1000001, 1) != -1) return 5;
+              /* a subtitle-like picture: transparent with two opaque text bars */
+              sub = calloc((size_t)w * hh, 4);
+              if (!sub) return 6;
+              for (y = 40; y < 160; y++)
+                  if (y < 90 || y > 110)
+                      memset(sub + ((size_t)y * w + 300) * 4, 0xff, (size_t)(w - 600) * 4);
+              t = clock();
+              for (i = 0; i < 50; i++)
+                  if (save("sub.png", sub, w, hh) != 0) return 7;
+              printf("1920x200 subtitle: %.2f ms per picture\n", (clock() - t) * 1000.0 / CLOCKS_PER_SEC / 50);
+              free(sub);
+              return 0;
+          }
+          CEOF
+          gcc loader.c -o loader -ldl
+          # stderr is exteplayer3's message channel: nothing may be printed on success
+          LD_LIBRARY_PATH=. ./loader 2> err.txt
+          cat err.txt
+          test ! -s err.txt
+          test ! -e bad.png
+          ls -l sub.png
+          python3 - <<'PEOF'
+          from PIL import Image
+          im = Image.open("out.png")
+          assert im.mode == "RGBA" and im.size == (3, 2), (im.mode, im.size)
+          assert list(im.tobytes()) == [i * 10 for i in range(24)], list(im.tobytes())
+          sub = Image.open("sub.png")
+          assert sub.size == (1920, 200) and sub.getpixel((0, 0)) == (0, 0, 0, 0) and sub.getpixel((960, 50)) == (255, 255, 255, 255)
+          print("PNG ok")
+          PEOF

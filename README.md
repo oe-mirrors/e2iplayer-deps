@@ -1,5 +1,11 @@
 # e2iplayer-deps
 
+<p align="center">
+  <img alt="GitHub repo size" src="https://img.shields.io/github/repo-size/oe-mirrors/e2iplayer-deps.svg">
+  <a href="https://visitorbadge.io/status?path=https://github.com/oe-mirrors/e2iplayer-deps"><img alt="Views" src="https://api.visitorbadge.io/api/visitors?path=https://github.com/oe-mirrors/e2iplayer-deps&label=Views&countColor=blue&style=flat"></a>
+  <a href="https://visitorbadge.io/status?path=https://github.com/oe-mirrors/e2iplayer-deps"><img alt="Visitors today" src="https://api.visitorbadge.io/api/daily?path=https://github.com/oe-mirrors/e2iplayer-deps&label=Visitors%20Today&countColor=blue&style=flat"></a>
+</p>
+
 Native helper binaries and the C subtitle parser bundled with
 [E2iPlayer](https://github.com/oe-mirrors/e2iplayer). Shipped as the
 `enigma2-plugin-extensions-e2iplayer-deps` package, built from the
@@ -18,8 +24,10 @@ OE/OpenATV feed recipe.
 [![hlsdl](https://img.shields.io/badge/hlsdl-v0.37-blue)](hlsdl/)
 [![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
-[![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
+[![cmdwrap](https://img.shields.io/badge/cmdwrap-2.0-blue)](cmdwrap/)
 [![f4mdump](https://img.shields.io/badge/f4mdump-v0.82-blue)](f4mdump/)
+[![e2ipow](https://img.shields.io/badge/e2ipow-1.0-blue)](e2ipow/)
+[![exteplayer3png](https://img.shields.io/badge/exteplayer3png-1.1-blue)](exteplayer3png/)
 
 ## SonarCloud status
 
@@ -53,6 +61,27 @@ prints the version string.
 ## cmdwrap
 
 Command-line argument splitter.
+
+## e2ipow
+
+Proof of work solvers, the native versions of E2iPlayer's Python solvers
+(about a hundred times faster on the box). The first argument picks the
+algorithm, `e2ipow --list` prints the supported ones, `e2ipow --version`
+the version string. Exit codes: 0 solved, 1 internal error, 2 usage or
+unknown algorithm, 3 time limit reached.
+
+```
+e2ipow byse <pow_nonce> <difficulty> <start> <step> <timeout seconds>
+-> {"solution": "<counter>" or null, "hashes": <tried>}
+   Byse video player, same arguments and output as scripts/bysepow.py
+```
+
+## exteplayer3png
+
+PNG writer plugin of exteplayer3 (`/usr/lib/exteplayer3png.so`, needs
+libpng). exteplayer3 loads it with `dlopen()` when it runs with
+`-G <directory>` and saves graphic subtitles (PGS / DVB / XSUB) there as PNG
+files; without the plugin those subtitle tracks cannot be shown.
 
 ## e2isubparser
 
@@ -138,21 +167,27 @@ bit-exact remuxing across codec parameter changes.
 
 ### 📜 License Information [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-This repository ships more than one license:
+This repository ships more than one license. Most tools started as
+samsamsam's E2iPlayer tools at [github.com/e2iplayer](https://github.com/e2iplayer)
+and are maintained here since.
 
-| Component | License |
-|---|---|
-| `hlsdl` | MIT — see [hlsdl/LICENSE](hlsdl/LICENSE) |
-| `lsdir`, `cmdwrap`, `e2isubparser`, `f4mdump` | GPLv3, released as part of [E2iPlayer](https://github.com/oe-mirrors/e2iplayer) — see its [LICENSE.txt](https://github.com/oe-mirrors/e2iplayer/blob/python3/LICENSE.txt) |
-| vendored Expat (in `e2isubparser`) | MIT |
-| vendored VLC / FFmpeg subtitle snippets (in `e2isubparser`) | LGPL 2.1+ |
-| vendored librtmp from rtmpdump v2.6 (in `f4mdump`) | LGPL 2.1 — see [f4mdump/ext/librtmp/COPYING](f4mdump/ext/librtmp/COPYING) |
-| vendored TinyXML-2 11.0.0 (in `f4mdump`) | zlib |
+| Component | License | Origin |
+|---|---|---|
+| `lsdir`, `cmdwrap` | GPLv3 — see [LICENSE](LICENSE) | [e2iplayer/e2ibox](https://github.com/e2iplayer/e2ibox) |
+| `e2isubparser` | GPLv3 — see [LICENSE](LICENSE) | [e2iplayer/e2isubparser](https://github.com/e2iplayer/e2isubparser) |
+| `f4mdump` | GPLv3 — see [LICENSE](LICENSE) | [e2iplayer/f4mdump](https://github.com/e2iplayer/f4mdump) |
+| `exteplayer3png` | GPLv3 — see [LICENSE](LICENSE) | [e2iplayer/exteplayer3png](https://github.com/e2iplayer/exteplayer3png) |
+| `e2ipow` | GPLv3 — see [LICENSE](LICENSE) | new here, port of E2iPlayer's Python solvers |
+| `hlsdl` | MIT — see [hlsdl/LICENSE](hlsdl/LICENSE) | [e2iplayer/hlsdl](https://github.com/e2iplayer/hlsdl), a fork of [selsta/hlsdl](https://github.com/selsta/hlsdl) |
+| vendored Expat (in `e2isubparser`) | MIT | [libexpat](https://github.com/libexpat/libexpat) 2.8.5 |
+| vendored VLC / FFmpeg subtitle snippets (in `e2isubparser`) | LGPL 2.1+ | VLC, FFmpeg |
+| vendored librtmp (in `f4mdump`) | LGPL 2.1 — see [f4mdump/ext/librtmp/COPYING](f4mdump/ext/librtmp/COPYING) | rtmpdump v2.6 |
+| vendored TinyXML-2 (in `f4mdump`) | zlib | [TinyXML-2](https://github.com/leethomason/tinyxml2) 11.0.0 |
 
-The E2iPlayer-authored components are free software; you can redistribute
-them and/or modify them under the terms of the GNU General Public License
-as published by the Free Software Foundation. Vendored third-party code
-keeps its own upstream license.
+The E2iPlayer components are free software; you can redistribute them
+and/or modify them under the terms of the GNU General Public License as
+published by the Free Software Foundation, version 3. Vendored third-party
+code keeps its own upstream license.
 
 <img width="127" height="51" alt="GPLv3 logo" src="https://www.gnu.org/graphics/gplv3-127x51.png" />
 
@@ -162,3 +197,11 @@ keeps its own upstream license.
 
 Pull requests welcome. Fork, branch, commit with a clear message, open a
 PR. CI (`build deps`) runs on every push and PR.
+
+---
+
+<p align="center">
+  Powered 💡 by <a href="https://www.opena.tv">openATV Team</a>
+</p>
+
+README Last Modified: 2026-10-26
