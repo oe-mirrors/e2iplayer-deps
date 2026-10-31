@@ -553,9 +553,15 @@ static bool merge_pmt(const pmt_data_t *pmt1, const pmt_data_t *pmt2, pmt_data_t
     return bRet;
 }
 
+/* Takes the timestamp out of the ID3 tags in front of raw audio and returns
+ * where the audio starts: encoders can put further tags behind the one with
+ * the timestamp (Elemental: com.elementaltechnologies.timestamp.utc). */
 static const uint8_t* get_dts_from_id3(const uint8_t *buf, uint32_t size, int64_t *dts)
 {
-    if (size >= 73)
+    const uint8_t *end = buf + size;
+    bool found = false;
+
+    while ((uint32_t)(end - buf) >= 10 && 0 == memcmp(buf, "ID3", 3))
     {
         uint32_t len = 0;
 
@@ -564,9 +570,12 @@ static const uint8_t* get_dts_from_id3(const uint8_t *buf, uint32_t size, int64_
               ((uint32_t)(buf[8] & 0x7f) << 7) |
               ((uint32_t) buf[9] & 0x7f);
         len += 10; // header
+        if (buf[5] & 0x10) len += 10; // footer
 
-        if (len <= size) {
-            uint8_t *ptr = (uint8_t *)memmem(buf, size, "com.apple.streaming.transportStreamTimestamp", 44);
+        if (len > (uint32_t)(end - buf)) break;
+
+        if (!found) {
+            const uint8_t *ptr = (const uint8_t *)memmem(buf, len, "com.apple.streaming.transportStreamTimestamp", 44);
             if (ptr) {
                 ptr += 45;
                 if (buf + len >= ptr + 8)
@@ -577,7 +586,7 @@ static const uint8_t* get_dts_from_id3(const uint8_t *buf, uint32_t size, int64_
                     if ((ts & ~((1ULL << 33) - 1)) == 0)
                     {
                         *dts = ts;
-                        return (buf + len);
+                        found = true;
                     }
                     else
                     {
@@ -586,8 +595,9 @@ static const uint8_t* get_dts_from_id3(const uint8_t *buf, uint32_t size, int64_
                 }
             }
         }
+        buf += len;
     }
-    return NULL;
+    return found ? buf : NULL;
 }
 
 bool adts_get_next_frame(const uint8_t **data_ptr, const uint8_t *end_ptr, uint32_t *frame_length)

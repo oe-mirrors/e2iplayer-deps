@@ -2126,14 +2126,17 @@ static void written_map_free(written_map_t *w)
 static uint8_t *audio_merge_start(ByteBuffer_t *seg)
 {
     if (seg->len >= 10 && 0 == memcmp(seg->data, "ID3", 3)) {
-        /* An ID3 tag can also sit in front of a TS segment (timed
-         * metadata) - only raw audio behind the tag is packed audio. The
-         * tag size is syncsafe (7 bits per byte), a footer adds 10 bytes. */
-        const uint8_t *d = seg->data;
-        size_t tag = 10 + (((size_t)(d[6] & 0x7f) << 21) | ((size_t)(d[7] & 0x7f) << 14)
-                         | ((size_t)(d[8] & 0x7f) << 7) | (size_t)(d[9] & 0x7f));
-        if (d[5] & 0x10) {
-            tag += 10;
+        /* ID3 tags can also sit in front of a TS segment (timed metadata) -
+         * only raw audio behind the tags is packed audio. The tag size is
+         * syncsafe (7 bits per byte), a footer adds 10 bytes. */
+        size_t tag = 0;
+        while (tag + 10 <= (size_t)seg->len && 0 == memcmp(seg->data + tag, "ID3", 3)) {
+            const uint8_t *d = seg->data + tag;
+            tag += 10 + (((size_t)(d[6] & 0x7f) << 21) | ((size_t)(d[7] & 0x7f) << 14)
+                       | ((size_t)(d[8] & 0x7f) << 7) | (size_t)(d[9] & 0x7f));
+            if (d[5] & 0x10) {
+                tag += 10;
+            }
         }
         if (tag < (size_t)seg->len && seg->data[tag] == TS_SYNC_BYTE
             && consecutive_sync_byte(seg->data + tag, (size_t)seg->len - tag, 3)) {

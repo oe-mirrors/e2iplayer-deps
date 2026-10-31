@@ -292,6 +292,35 @@ jobs:
           # the audio frames have to be readable, not only announced in the PMT
           apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_packed.ts | head -1)
           test "$apk" -gt 50
+      - name: fixture - packed audio with a second ID3 tag in front of the raw audio
+        run: |
+          set -eux
+          cd fx
+          # Elemental encoders (ARD live) put a second tag behind the one with
+          # the timestamp: the audio was taken for an unknown codec and dropped.
+          # Also with the timestamp in the second tag.
+          python3 - <<'EOF'
+          import struct
+          body = b'com.elementaltechnologies.timestamp.utc\x002026-10-31T08:19:04Z'
+          frame = b'PRIV' + struct.pack('>I', len(body)) + b'\x00\x00' + body
+          tag = b'ID3\x04\x00\x00' + bytes([0, 0, 0, len(frame)]) + frame
+          src = open('packed.m3u8').read().split('\n')
+          for l in src:
+              if l.endswith('.aac'):
+                  d = open(l, 'rb').read()
+                  first = 10 + d[9]
+                  open('two' + l, 'wb').write(d[:first] + tag + d[first:])
+                  open('rev' + l, 'wb').write(tag + d)
+          for name in ('two', 'rev'):
+              open(name + '.m3u8', 'w').write('\n'.join((name + l) if l.endswith('.aac') else l for l in src))
+          EOF
+          apk() { ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$1" | head -1; }
+          for name in two rev; do
+            timeout 60 ../hlsdl/hlsdl -f -a $name.m3u8 -o out_$name.ts vplaylist.m3u8 2>$name.log
+            cat $name.log
+            ! grep -q 'Could not merge' $name.log
+            test "$(apk out_$name.ts)" -eq "$(apk out_packed.ts)"
+          done
       - name: fixture - live TS video + separate audio playlist
         run: |
           set -eux
@@ -440,12 +469,16 @@ jobs:
           for l in src.split('\n'):
               if l.endswith('.ts'):
                   open('id3' + l, 'wb').write(tag + open(l, 'rb').read())
+                  open('two' + l, 'wb').write(tag + tag + open(l, 'rb').read())
           open('id3a.m3u8', 'w').write('\n'.join(('id3' + l) if l.endswith('.ts') else l for l in src.split('\n')))
+          open('twoa.m3u8', 'w').write('\n'.join(('two' + l) if l.endswith('.ts') else l for l in src.split('\n')))
           EOF
-          timeout 60 ../hlsdl/hlsdl -f -a id3a.m3u8 -o out_id3ts.ts vplaylist.m3u8 2>id3ts.log
-          cat id3ts.log
-          ! grep -q 'Could not merge' id3ts.log
-          test "$(pk out_id3ts.ts)" -eq "$(pk out_av.ts)"
+          for name in id3a twoa; do
+            timeout 60 ../hlsdl/hlsdl -f -a $name.m3u8 -o out_$name.ts vplaylist.m3u8 2>$name.log
+            cat $name.log
+            ! grep -q 'Could not merge' $name.log
+            test "$(pk out_$name.ts)" -eq "$(pk out_av.ts)"
+          done
           # After a discontinuity the TS PIDs / PMT change (ad break): the
           # merge has to work its PMT out again, or the audio after it is lost
           ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video \
